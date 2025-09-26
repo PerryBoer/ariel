@@ -1,0 +1,66 @@
+:py:mod:`olympic_arena`
+=====================================================
+
+.. py:module:: ariel.simulation.environments.olympic_arena
+
+.. autoapi-nested-parse::
+
+   TODO(jmdm): description of script.
+
+
+
+Module Contents
+---------------
+
+Classes
+~~~~~~~
+
+.. autoapisummary::
+
+   ariel.simulation.environments.olympic_arena.OlympicArena
+
+
+
+
+Attributes
+~~~~~~~~~~
+
+.. autoapisummary::
+
+   ariel.simulation.environments.olympic_arena.USE_DEGREES
+
+
+.. py:data:: USE_DEGREES
+   :value: False
+
+
+.. py:class:: OlympicArena(floor_size: tuple[float, float, float] = (100, 100, 0.1))
+
+   Specification for a basic MuJoCo world.
+
+
+   .. py:attribute:: floor_size
+      :value: (100, 100, 0.1)
+
+
+
+   .. py:attribute:: spec
+      :type:  mujoco.MjSpec
+
+
+   .. py:method:: spawn(mj_spec: mujoco.MjSpec, spawn_position: list[float, float, float] | None = None, *, small_gap: float = 0.0, correct_for_bounding_box: bool = True) -> None
+
+      Spawn a robot at a specific position in the world.
+
+      :param mj_spec: The MuJoCo specification for the robot.
+      :type mj_spec: :class:`mujoco.MjSpec`
+      :param spawn_position: The position (x, y, z) to spawn the robot at, by default (0, 0, 0)
+      :type spawn_position: :class:`list[float`, :class:`float`, :class:`float] | None`, *optional*
+      :param small_gap: A small gap to add to the spawn position, by default 0.0
+      :type small_gap: :class:`float`, *optional*
+      :param correct_for_bounding_box: If True, the spawn position will be adjusted to account for the robot's bounding box,
+                                       by default True
+      :type correct_for_bounding_box: :class:`bool`, *optional*
+
+
+
