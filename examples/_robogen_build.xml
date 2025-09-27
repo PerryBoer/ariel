@@ -1,0 +1,565 @@
+<mujoco model="MuJoCo Model">
+  <compiler angle="radian"/>
+
+  <option integrator="implicitfast"/>
+
+  <visual>
+    <global offwidth="1280" offheight="960"/>
+  </visual>
+
+  <default>
+    <default class="robot-main">
+      <default class="robot-1-0-main"/>
+      <default class="robot-2-0-main"/>
+      <default class="robot-3-0-main"/>
+      <default class="robot-4-2-main"/>
+      <default class="robot-5-3-main"/>
+      <default class="robot-6-4-main"/>
+      <default class="robot-7-5-main"/>
+      <default class="robot-8-1-main"/>
+      <default class="robot-9-1-main"/>
+      <default class="robot-10-0-main"/>
+      <default class="robot-11-2-main"/>
+      <default class="robot-12-3-main"/>
+      <default class="robot-13-4-main"/>
+      <default class="robot-14-5-main"/>
+      <default class="robot-15-2-main"/>
+      <default class="robot-16-2-main"/>
+      <default class="robot-17-0-main"/>
+      <default class="robot-18-2-main"/>
+      <default class="robot-19-3-main"/>
+      <default class="robot-20-4-main"/>
+      <default class="robot-21-5-main"/>
+      <default class="robot-22-3-main"/>
+      <default class="robot-23-3-main"/>
+      <default class="robot-24-0-main"/>
+      <default class="robot-25-2-main"/>
+      <default class="robot-26-3-main"/>
+      <default class="robot-27-4-main"/>
+      <default class="robot-28-5-main"/>
+      <default class="robot-29-4-main"/>
+      <default class="robot-30-4-main"/>
+      <default class="robot-31-0-main"/>
+      <default class="robot-32-2-main"/>
+      <default class="robot-33-3-main"/>
+      <default class="robot-34-4-main"/>
+      <default class="robot-35-5-main"/>
+      <default class="robot-36-5-main"/>
+      <default class="robot-37-5-main"/>
+      <default class="robot-38-0-main"/>
+      <default class="robot-39-2-main"/>
+      <default class="robot-40-3-main"/>
+      <default class="robot-41-4-main"/>
+      <default class="robot-42-5-main"/>
+    </default>
+  </default>
+
+  <asset>
+    <texture type="2d" colorspace="auto" name="grid" builtin="checker" rgb1="0.1 0.2 0.3" rgb2="0.2 0.3 0.4" width="600" height="600"/>
+    <material name="grid" texture="grid" texuniform="true" texrepeat="3 3" reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <geom name="floor" size="1 1 0.1" type="plane" material="grid"/>
+    <site pos="0 0 0.42062"/>
+    <light name="light" pos="0 0 1" dir="0 0 -1" castshadow="false"/>
+    <body name="robot-world" pos="0 0 0.42062">
+      <joint type="free"/>
+      <body name="robot-core">
+        <geom name="robot-core" size="0.1 0.1 0.1" pos="0 0.1 0" type="box" mass="1" rgba="0.992157 0.792157 0.25098 0.5"/>
+        <site name="robot-core-front" pos="0 0.2 -0.05"/>
+        <site name="robot-core-back" pos="0 0 -0.05" quat="0 0 0 1"/>
+        <site name="robot-core-left" pos="-0.1 0.1 -0.05" quat="0.707107 0 0 0.707107"/>
+        <site name="robot-core-right" pos="0.1 0.1 -0.05" quat="-0.707107 0 0 0.707107"/>
+        <site name="robot-core-top" pos="0 0.1 0.1" quat="0.707107 0.707107 0 0"/>
+        <site name="robot-core-bottom" pos="0 0.1 -0.1" quat="0 0 -0.707107 0.707107"/>
+        <body name="robot-1-0-hinge" pos="0 0.2 -0.05">
+          <body name="robot-1-0-stator" pos="0 0.03 0">
+            <geom name="robot-1-0-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+          </body>
+          <body name="robot-1-0-rotor" pos="0 0.08 0">
+            <joint name="robot-1-0-servo" pos="0 -0.02 0" axis="0 0 1"/>
+            <geom name="robot-1-0-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+            <site name="robot-1-0-hinge-front" pos="0 0.02 0"/>
+            <body name="robot-2-0-core" pos="0 0.02 0">
+              <geom name="robot-2-0-core" size="0.05 0.05 0.05" pos="0 0.05 0" type="box" mass="0.055" rgba="0.109804 0.466667 0.764706 0.5"/>
+              <site name="robot-2-0-core-front" pos="0 0.1 0"/>
+              <site name="robot-2-0-core-left" pos="-0.05 0.05 0" quat="0.707107 0 0 0.707107"/>
+              <site name="robot-2-0-core-right" pos="0.05 0.05 0" quat="-0.707107 0 0 0.707107"/>
+              <site name="robot-2-0-core-top" pos="0 0.05 0.05" quat="0.707107 0.707107 0 0"/>
+              <site name="robot-2-0-core-bottom" pos="0 0.05 -0.05" quat="0 0 -0.707107 0.707107"/>
+              <body name="robot-3-0-hinge" pos="0 0.1 0">
+                <body name="robot-3-0-stator" pos="0 0.03 0">
+                  <geom name="robot-3-0-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-3-0-rotor" pos="0 0.08 0">
+                  <joint name="robot-3-0-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-3-0-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-3-0-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-4-2-hinge" pos="0.05 0.05 0" quat="-0.707107 0 0 0.707107">
+                <body name="robot-4-2-stator" pos="0 0.03 0">
+                  <geom name="robot-4-2-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-4-2-rotor" pos="0 0.08 0">
+                  <joint name="robot-4-2-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-4-2-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-4-2-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-5-3-hinge" pos="-0.05 0.05 0" quat="0.707107 0 0 0.707107">
+                <body name="robot-5-3-stator" pos="0 0.03 0">
+                  <geom name="robot-5-3-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-5-3-rotor" pos="0 0.08 0">
+                  <joint name="robot-5-3-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-5-3-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-5-3-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-6-4-hinge" pos="0 0.05 0.05" quat="0.707107 0.707107 0 0">
+                <body name="robot-6-4-stator" pos="0 0.03 0">
+                  <geom name="robot-6-4-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-6-4-rotor" pos="0 0.08 0">
+                  <joint name="robot-6-4-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-6-4-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-6-4-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-7-5-hinge" pos="0 0.05 -0.05" quat="0 0 -0.707107 0.707107">
+                <body name="robot-7-5-stator" pos="0 0.03 0">
+                  <geom name="robot-7-5-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-7-5-rotor" pos="0 0.08 0">
+                  <joint name="robot-7-5-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-7-5-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-7-5-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+        <body name="robot-8-1-hinge" pos="0 0 -0.05" quat="0 0 0 1">
+          <body name="robot-8-1-stator" pos="0 0.03 0">
+            <geom name="robot-8-1-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+          </body>
+          <body name="robot-8-1-rotor" pos="0 0.08 0">
+            <joint name="robot-8-1-servo" pos="0 -0.02 0" axis="0 0 1"/>
+            <geom name="robot-8-1-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+            <site name="robot-8-1-hinge-front" pos="0 0.02 0"/>
+            <body name="robot-9-1-core" pos="0 0.02 0">
+              <geom name="robot-9-1-core" size="0.05 0.05 0.05" pos="0 0.05 0" type="box" mass="0.055" rgba="0.109804 0.466667 0.764706 0.5"/>
+              <site name="robot-9-1-core-front" pos="0 0.1 0"/>
+              <site name="robot-9-1-core-left" pos="-0.05 0.05 0" quat="0.707107 0 0 0.707107"/>
+              <site name="robot-9-1-core-right" pos="0.05 0.05 0" quat="-0.707107 0 0 0.707107"/>
+              <site name="robot-9-1-core-top" pos="0 0.05 0.05" quat="0.707107 0.707107 0 0"/>
+              <site name="robot-9-1-core-bottom" pos="0 0.05 -0.05" quat="0 0 -0.707107 0.707107"/>
+              <body name="robot-10-0-hinge" pos="0 0.1 0">
+                <body name="robot-10-0-stator" pos="0 0.03 0">
+                  <geom name="robot-10-0-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-10-0-rotor" pos="0 0.08 0">
+                  <joint name="robot-10-0-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-10-0-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-10-0-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-11-2-hinge" pos="0.05 0.05 0" quat="-0.707107 0 0 0.707107">
+                <body name="robot-11-2-stator" pos="0 0.03 0">
+                  <geom name="robot-11-2-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-11-2-rotor" pos="0 0.08 0">
+                  <joint name="robot-11-2-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-11-2-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-11-2-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-12-3-hinge" pos="-0.05 0.05 0" quat="0.707107 0 0 0.707107">
+                <body name="robot-12-3-stator" pos="0 0.03 0">
+                  <geom name="robot-12-3-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-12-3-rotor" pos="0 0.08 0">
+                  <joint name="robot-12-3-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-12-3-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-12-3-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-13-4-hinge" pos="0 0.05 0.05" quat="0.707107 0.707107 0 0">
+                <body name="robot-13-4-stator" pos="0 0.03 0">
+                  <geom name="robot-13-4-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-13-4-rotor" pos="0 0.08 0">
+                  <joint name="robot-13-4-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-13-4-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-13-4-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-14-5-hinge" pos="0 0.05 -0.05" quat="0 0 -0.707107 0.707107">
+                <body name="robot-14-5-stator" pos="0 0.03 0">
+                  <geom name="robot-14-5-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-14-5-rotor" pos="0 0.08 0">
+                  <joint name="robot-14-5-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-14-5-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-14-5-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+        <body name="robot-15-2-hinge" pos="0.1 0.1 -0.05" quat="-0.707107 0 0 0.707107">
+          <body name="robot-15-2-stator" pos="0 0.03 0">
+            <geom name="robot-15-2-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+          </body>
+          <body name="robot-15-2-rotor" pos="0 0.08 0">
+            <joint name="robot-15-2-servo" pos="0 -0.02 0" axis="0 0 1"/>
+            <geom name="robot-15-2-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+            <site name="robot-15-2-hinge-front" pos="0 0.02 0"/>
+            <body name="robot-16-2-core" pos="0 0.02 0">
+              <geom name="robot-16-2-core" size="0.05 0.05 0.05" pos="0 0.05 0" type="box" mass="0.055" rgba="0.109804 0.466667 0.764706 0.5"/>
+              <site name="robot-16-2-core-front" pos="0 0.1 0"/>
+              <site name="robot-16-2-core-left" pos="-0.05 0.05 0" quat="0.707107 0 0 0.707107"/>
+              <site name="robot-16-2-core-right" pos="0.05 0.05 0" quat="-0.707107 0 0 0.707107"/>
+              <site name="robot-16-2-core-top" pos="0 0.05 0.05" quat="0.707107 0.707107 0 0"/>
+              <site name="robot-16-2-core-bottom" pos="0 0.05 -0.05" quat="0 0 -0.707107 0.707107"/>
+              <body name="robot-17-0-hinge" pos="0 0.1 0">
+                <body name="robot-17-0-stator" pos="0 0.03 0">
+                  <geom name="robot-17-0-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-17-0-rotor" pos="0 0.08 0">
+                  <joint name="robot-17-0-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-17-0-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-17-0-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-18-2-hinge" pos="0.05 0.05 0" quat="-0.707107 0 0 0.707107">
+                <body name="robot-18-2-stator" pos="0 0.03 0">
+                  <geom name="robot-18-2-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-18-2-rotor" pos="0 0.08 0">
+                  <joint name="robot-18-2-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-18-2-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-18-2-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-19-3-hinge" pos="-0.05 0.05 0" quat="0.707107 0 0 0.707107">
+                <body name="robot-19-3-stator" pos="0 0.03 0">
+                  <geom name="robot-19-3-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-19-3-rotor" pos="0 0.08 0">
+                  <joint name="robot-19-3-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-19-3-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-19-3-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-20-4-hinge" pos="0 0.05 0.05" quat="0.707107 0.707107 0 0">
+                <body name="robot-20-4-stator" pos="0 0.03 0">
+                  <geom name="robot-20-4-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-20-4-rotor" pos="0 0.08 0">
+                  <joint name="robot-20-4-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-20-4-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-20-4-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-21-5-hinge" pos="0 0.05 -0.05" quat="0 0 -0.707107 0.707107">
+                <body name="robot-21-5-stator" pos="0 0.03 0">
+                  <geom name="robot-21-5-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-21-5-rotor" pos="0 0.08 0">
+                  <joint name="robot-21-5-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-21-5-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-21-5-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+        <body name="robot-22-3-hinge" pos="-0.1 0.1 -0.05" quat="0.707107 0 0 0.707107">
+          <body name="robot-22-3-stator" pos="0 0.03 0">
+            <geom name="robot-22-3-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+          </body>
+          <body name="robot-22-3-rotor" pos="0 0.08 0">
+            <joint name="robot-22-3-servo" pos="0 -0.02 0" axis="0 0 1"/>
+            <geom name="robot-22-3-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+            <site name="robot-22-3-hinge-front" pos="0 0.02 0"/>
+            <body name="robot-23-3-core" pos="0 0.02 0">
+              <geom name="robot-23-3-core" size="0.05 0.05 0.05" pos="0 0.05 0" type="box" mass="0.055" rgba="0.109804 0.466667 0.764706 0.5"/>
+              <site name="robot-23-3-core-front" pos="0 0.1 0"/>
+              <site name="robot-23-3-core-left" pos="-0.05 0.05 0" quat="0.707107 0 0 0.707107"/>
+              <site name="robot-23-3-core-right" pos="0.05 0.05 0" quat="-0.707107 0 0 0.707107"/>
+              <site name="robot-23-3-core-top" pos="0 0.05 0.05" quat="0.707107 0.707107 0 0"/>
+              <site name="robot-23-3-core-bottom" pos="0 0.05 -0.05" quat="0 0 -0.707107 0.707107"/>
+              <body name="robot-24-0-hinge" pos="0 0.1 0">
+                <body name="robot-24-0-stator" pos="0 0.03 0">
+                  <geom name="robot-24-0-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-24-0-rotor" pos="0 0.08 0">
+                  <joint name="robot-24-0-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-24-0-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-24-0-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-25-2-hinge" pos="0.05 0.05 0" quat="-0.707107 0 0 0.707107">
+                <body name="robot-25-2-stator" pos="0 0.03 0">
+                  <geom name="robot-25-2-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-25-2-rotor" pos="0 0.08 0">
+                  <joint name="robot-25-2-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-25-2-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-25-2-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-26-3-hinge" pos="-0.05 0.05 0" quat="0.707107 0 0 0.707107">
+                <body name="robot-26-3-stator" pos="0 0.03 0">
+                  <geom name="robot-26-3-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-26-3-rotor" pos="0 0.08 0">
+                  <joint name="robot-26-3-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-26-3-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-26-3-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-27-4-hinge" pos="0 0.05 0.05" quat="0.707107 0.707107 0 0">
+                <body name="robot-27-4-stator" pos="0 0.03 0">
+                  <geom name="robot-27-4-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-27-4-rotor" pos="0 0.08 0">
+                  <joint name="robot-27-4-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-27-4-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-27-4-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-28-5-hinge" pos="0 0.05 -0.05" quat="0 0 -0.707107 0.707107">
+                <body name="robot-28-5-stator" pos="0 0.03 0">
+                  <geom name="robot-28-5-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-28-5-rotor" pos="0 0.08 0">
+                  <joint name="robot-28-5-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-28-5-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-28-5-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+        <body name="robot-29-4-hinge" pos="0 0.1 0.1" quat="0.707107 0.707107 0 0">
+          <body name="robot-29-4-stator" pos="0 0.03 0">
+            <geom name="robot-29-4-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+          </body>
+          <body name="robot-29-4-rotor" pos="0 0.08 0">
+            <joint name="robot-29-4-servo" pos="0 -0.02 0" axis="0 0 1"/>
+            <geom name="robot-29-4-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+            <site name="robot-29-4-hinge-front" pos="0 0.02 0"/>
+            <body name="robot-30-4-core" pos="0 0.02 0">
+              <geom name="robot-30-4-core" size="0.05 0.05 0.05" pos="0 0.05 0" type="box" mass="0.055" rgba="0.109804 0.466667 0.764706 0.5"/>
+              <site name="robot-30-4-core-front" pos="0 0.1 0"/>
+              <site name="robot-30-4-core-left" pos="-0.05 0.05 0" quat="0.707107 0 0 0.707107"/>
+              <site name="robot-30-4-core-right" pos="0.05 0.05 0" quat="-0.707107 0 0 0.707107"/>
+              <site name="robot-30-4-core-top" pos="0 0.05 0.05" quat="0.707107 0.707107 0 0"/>
+              <site name="robot-30-4-core-bottom" pos="0 0.05 -0.05" quat="0 0 -0.707107 0.707107"/>
+              <body name="robot-31-0-hinge" pos="0 0.1 0">
+                <body name="robot-31-0-stator" pos="0 0.03 0">
+                  <geom name="robot-31-0-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-31-0-rotor" pos="0 0.08 0">
+                  <joint name="robot-31-0-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-31-0-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-31-0-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-32-2-hinge" pos="0.05 0.05 0" quat="-0.707107 0 0 0.707107">
+                <body name="robot-32-2-stator" pos="0 0.03 0">
+                  <geom name="robot-32-2-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-32-2-rotor" pos="0 0.08 0">
+                  <joint name="robot-32-2-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-32-2-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-32-2-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-33-3-hinge" pos="-0.05 0.05 0" quat="0.707107 0 0 0.707107">
+                <body name="robot-33-3-stator" pos="0 0.03 0">
+                  <geom name="robot-33-3-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-33-3-rotor" pos="0 0.08 0">
+                  <joint name="robot-33-3-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-33-3-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-33-3-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-34-4-hinge" pos="0 0.05 0.05" quat="0.707107 0.707107 0 0">
+                <body name="robot-34-4-stator" pos="0 0.03 0">
+                  <geom name="robot-34-4-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-34-4-rotor" pos="0 0.08 0">
+                  <joint name="robot-34-4-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-34-4-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-34-4-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-35-5-hinge" pos="0 0.05 -0.05" quat="0 0 -0.707107 0.707107">
+                <body name="robot-35-5-stator" pos="0 0.03 0">
+                  <geom name="robot-35-5-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-35-5-rotor" pos="0 0.08 0">
+                  <joint name="robot-35-5-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-35-5-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-35-5-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+        <body name="robot-36-5-hinge" pos="0 0.1 -0.1" quat="0 0 -0.707107 0.707107">
+          <body name="robot-36-5-stator" pos="0 0.03 0">
+            <geom name="robot-36-5-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+          </body>
+          <body name="robot-36-5-rotor" pos="0 0.08 0">
+            <joint name="robot-36-5-servo" pos="0 -0.02 0" axis="0 0 1"/>
+            <geom name="robot-36-5-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+            <site name="robot-36-5-hinge-front" pos="0 0.02 0"/>
+            <body name="robot-37-5-core" pos="0 0.02 0">
+              <geom name="robot-37-5-core" size="0.05 0.05 0.05" pos="0 0.05 0" type="box" mass="0.055" rgba="0.109804 0.466667 0.764706 0.5"/>
+              <site name="robot-37-5-core-front" pos="0 0.1 0"/>
+              <site name="robot-37-5-core-left" pos="-0.05 0.05 0" quat="0.707107 0 0 0.707107"/>
+              <site name="robot-37-5-core-right" pos="0.05 0.05 0" quat="-0.707107 0 0 0.707107"/>
+              <site name="robot-37-5-core-top" pos="0 0.05 0.05" quat="0.707107 0.707107 0 0"/>
+              <site name="robot-37-5-core-bottom" pos="0 0.05 -0.05" quat="0 0 -0.707107 0.707107"/>
+              <body name="robot-38-0-hinge" pos="0 0.1 0">
+                <body name="robot-38-0-stator" pos="0 0.03 0">
+                  <geom name="robot-38-0-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-38-0-rotor" pos="0 0.08 0">
+                  <joint name="robot-38-0-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-38-0-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-38-0-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-39-2-hinge" pos="0.05 0.05 0" quat="-0.707107 0 0 0.707107">
+                <body name="robot-39-2-stator" pos="0 0.03 0">
+                  <geom name="robot-39-2-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-39-2-rotor" pos="0 0.08 0">
+                  <joint name="robot-39-2-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-39-2-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-39-2-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-40-3-hinge" pos="-0.05 0.05 0" quat="0.707107 0 0 0.707107">
+                <body name="robot-40-3-stator" pos="0 0.03 0">
+                  <geom name="robot-40-3-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-40-3-rotor" pos="0 0.08 0">
+                  <joint name="robot-40-3-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-40-3-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-40-3-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-41-4-hinge" pos="0 0.05 0.05" quat="0.707107 0.707107 0 0">
+                <body name="robot-41-4-stator" pos="0 0.03 0">
+                  <geom name="robot-41-4-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-41-4-rotor" pos="0 0.08 0">
+                  <joint name="robot-41-4-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-41-4-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-41-4-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+              <body name="robot-42-5-hinge" pos="0 0.05 -0.05" quat="0 0 -0.707107 0.707107">
+                <body name="robot-42-5-stator" pos="0 0.03 0">
+                  <geom name="robot-42-5-stator" size="0.02475 0.0297 0.02475" type="box" mass="0.02" rgba="0.87451 0.160784 0.207843 0.5"/>
+                </body>
+                <body name="robot-42-5-rotor" pos="0 0.08 0">
+                  <joint name="robot-42-5-servo" pos="0 -0.02 0" axis="0 0 1"/>
+                  <geom name="robot-42-5-rotor" size="0.025 0.02 0.025" type="box" mass="0.04" rgba="0.627451 0.0941176 0.129412 0.5"/>
+                  <site name="robot-42-5-hinge-front" pos="0 0.02 0"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <contact>
+    <exclude body1="robot-1-0-stator" body2="robot-1-0-rotor"/>
+    <exclude body1="robot-3-0-stator" body2="robot-3-0-rotor"/>
+    <exclude body1="robot-4-2-stator" body2="robot-4-2-rotor"/>
+    <exclude body1="robot-5-3-stator" body2="robot-5-3-rotor"/>
+    <exclude body1="robot-6-4-stator" body2="robot-6-4-rotor"/>
+    <exclude body1="robot-7-5-stator" body2="robot-7-5-rotor"/>
+    <exclude body1="robot-8-1-stator" body2="robot-8-1-rotor"/>
+    <exclude body1="robot-10-0-stator" body2="robot-10-0-rotor"/>
+    <exclude body1="robot-11-2-stator" body2="robot-11-2-rotor"/>
+    <exclude body1="robot-12-3-stator" body2="robot-12-3-rotor"/>
+    <exclude body1="robot-13-4-stator" body2="robot-13-4-rotor"/>
+    <exclude body1="robot-14-5-stator" body2="robot-14-5-rotor"/>
+    <exclude body1="robot-15-2-stator" body2="robot-15-2-rotor"/>
+    <exclude body1="robot-17-0-stator" body2="robot-17-0-rotor"/>
+    <exclude body1="robot-18-2-stator" body2="robot-18-2-rotor"/>
+    <exclude body1="robot-19-3-stator" body2="robot-19-3-rotor"/>
+    <exclude body1="robot-20-4-stator" body2="robot-20-4-rotor"/>
+    <exclude body1="robot-21-5-stator" body2="robot-21-5-rotor"/>
+    <exclude body1="robot-22-3-stator" body2="robot-22-3-rotor"/>
+    <exclude body1="robot-24-0-stator" body2="robot-24-0-rotor"/>
+    <exclude body1="robot-25-2-stator" body2="robot-25-2-rotor"/>
+    <exclude body1="robot-26-3-stator" body2="robot-26-3-rotor"/>
+    <exclude body1="robot-27-4-stator" body2="robot-27-4-rotor"/>
+    <exclude body1="robot-28-5-stator" body2="robot-28-5-rotor"/>
+    <exclude body1="robot-29-4-stator" body2="robot-29-4-rotor"/>
+    <exclude body1="robot-31-0-stator" body2="robot-31-0-rotor"/>
+    <exclude body1="robot-32-2-stator" body2="robot-32-2-rotor"/>
+    <exclude body1="robot-33-3-stator" body2="robot-33-3-rotor"/>
+    <exclude body1="robot-34-4-stator" body2="robot-34-4-rotor"/>
+    <exclude body1="robot-35-5-stator" body2="robot-35-5-rotor"/>
+    <exclude body1="robot-36-5-stator" body2="robot-36-5-rotor"/>
+    <exclude body1="robot-38-0-stator" body2="robot-38-0-rotor"/>
+    <exclude body1="robot-39-2-stator" body2="robot-39-2-rotor"/>
+    <exclude body1="robot-40-3-stator" body2="robot-40-3-rotor"/>
+    <exclude body1="robot-41-4-stator" body2="robot-41-4-rotor"/>
+    <exclude body1="robot-42-5-stator" body2="robot-42-5-rotor"/>
+  </contact>
+
+  <actuator>
+    <general name="robot-1-0-servo" joint="robot-1-0-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-3-0-servo" joint="robot-3-0-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-4-2-servo" joint="robot-4-2-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-5-3-servo" joint="robot-5-3-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-6-4-servo" joint="robot-6-4-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-7-5-servo" joint="robot-7-5-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-8-1-servo" joint="robot-8-1-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-10-0-servo" joint="robot-10-0-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-11-2-servo" joint="robot-11-2-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-12-3-servo" joint="robot-12-3-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-13-4-servo" joint="robot-13-4-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-14-5-servo" joint="robot-14-5-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-15-2-servo" joint="robot-15-2-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-17-0-servo" joint="robot-17-0-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-18-2-servo" joint="robot-18-2-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-19-3-servo" joint="robot-19-3-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-20-4-servo" joint="robot-20-4-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-21-5-servo" joint="robot-21-5-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-22-3-servo" joint="robot-22-3-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-24-0-servo" joint="robot-24-0-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-25-2-servo" joint="robot-25-2-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-26-3-servo" joint="robot-26-3-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-27-4-servo" joint="robot-27-4-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-28-5-servo" joint="robot-28-5-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-29-4-servo" joint="robot-29-4-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-31-0-servo" joint="robot-31-0-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-32-2-servo" joint="robot-32-2-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-33-3-servo" joint="robot-33-3-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-34-4-servo" joint="robot-34-4-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-35-5-servo" joint="robot-35-5-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-36-5-servo" joint="robot-36-5-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-38-0-servo" joint="robot-38-0-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-39-2-servo" joint="robot-39-2-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-40-3-servo" joint="robot-40-3-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-41-4-servo" joint="robot-41-4-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+    <general name="robot-42-5-servo" joint="robot-42-5-servo" ctrlrange="-1.5708 1.5708" dynprm="0 0 0 0 0 0 0 0 0 0" biastype="affine" biasprm="0 -1 -1"/>
+  </actuator>
+</mujoco>
