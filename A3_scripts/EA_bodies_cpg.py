@@ -5,7 +5,7 @@ Evolutionary algorithm to evolve the robot body. Performs:
 - gaussian mutation per genotype vector
 - non-learner filter (short probe to discard statues)
 - dynamic simulation duration per generation
-Saves best robot json and video after final generation.
+Saves best fitness per generation and best robot json and video after final generation.
 """
 
 from pathlib import Path
@@ -367,9 +367,6 @@ def run_ea():
         fitnesses = [combined_fit[i] for i in order]
         histories = [combined_hist[i] for i in order]
 
-        print("Survivors:")
-        for r, f in enumerate(fitnesses):
-            print(f"{r+1}: {f:.4f}")
         print(f"Best fitness: {fitnesses[0]:.4f}")
         best_fit_per_gen.append(fitnesses[0])
 
