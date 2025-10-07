@@ -15,6 +15,8 @@ import mujoco as mj
 import numpy as np
 import numpy.typing as npt
 from mujoco import viewer
+import csv
+from datetime import datetime
 
 # Local libraries
 from ariel import console
@@ -70,6 +72,8 @@ CWD = Path.cwd()
 OUTPUT = CWD / "__output__"
 OUTPUT.mkdir(parents=True, exist_ok=True)
 
+# Timestamp for output files
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 # ======================================================================
 # Controller: Fixed CPG (global sine) with alternation + amplitude ramp
@@ -296,7 +300,7 @@ def run_ea():
 
     # Initial population with viability filter
     population = [make_viable_random() for _ in range(POP_SIZE)]
-    fitnesses, histories = [], []
+    fitnesses, histories, best_fit_per_gen = [], [], []
 
     # Initial evaluation with short duration
     duration_this_gen = DUR_SHORT
@@ -366,7 +370,10 @@ def run_ea():
         print("Survivors:")
         for r, f in enumerate(fitnesses):
             print(f"{r+1}: {f:.4f}")
+        print(f"Best fitness: {fitnesses[0]:.4f}")
+        best_fit_per_gen.append(fitnesses[0])
 
+       
     # Final artifacts
     best_idx = int(np.argmax(fitnesses))
     best_gen, best_hist, best_fit = population[best_idx], histories[best_idx], fitnesses[best_idx]
@@ -375,8 +382,20 @@ def run_ea():
 
     # Save best robot graph
     robot_graph, core = decode_and_build(best_gen)
-    save_graph_as_json(robot_graph, OUTPUT / "best_robot.json")
-    print(f"Saved best robot graph to {OUTPUT/'best_robot.json'}")
+    graph_folder = OUTPUT / "best_robot_graphs"
+    graph_folder.mkdir(exist_ok=True)
+    graph_file = f"best_robot_{TIMESTAMP}.json"
+    save_graph_as_json(robot_graph, graph_folder / graph_file)
+    print(f"\nSaved best robot graph to {graph_folder / graph_file}")
+
+    # Save best fitness per generation
+    fitness_folder = OUTPUT / "fitness_per_gen"
+    fitness_folder.mkdir(exist_ok=True)
+    fitness_file = f"fitness_{TIMESTAMP}.csv"
+    with open(fitness_folder/fitness_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(best_fit_per_gen)
+    print(f"Saved best fitness values per generation to {fitness_folder/fitness_file}")
 
     # Save video of best robot (use longer duration for clarity)
     mj.set_mjcb_control(None)

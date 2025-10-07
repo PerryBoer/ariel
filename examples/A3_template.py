@@ -249,6 +249,7 @@ def main() -> None:
         conn_p_genes,
         rot_p_genes,
     ]
+    print(genotype)
 
     nde = NeuralDevelopmentalEncoding(number_of_modules=NUM_OF_MODULES)
     p_matrices = nde.forward(genotype)
@@ -288,7 +289,7 @@ def main() -> None:
         tracker=tracker,
     )
 
-    experiment(robot=core, controller=ctrl, mode="launcher")
+    experiment(robot=core, controller=ctrl, mode="video")
 
     show_xpos_history(tracker.history["xpos"][0])
 
