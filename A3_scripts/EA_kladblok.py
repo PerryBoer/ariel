@@ -1,22 +1,29 @@
 """
-Outer-loop GA for evolving viable walking bodies (legal priors + filters).
+Outer GA + Inner RevDE (single-script, single fitness)
 - Operates ONLY on the three NDE input vectors (type, connection, rotation).
-- Staged evaluation: static checks -> random-moves probe -> gentle CPG probe.
-- Uses a surrogate viability score for selection in early gens, then switches to true fitness.
-- Tournament selection, symmetry-aware mutation, elitism, caching.
+- One objective only: negative distance to TARGET_POSITION after rollout.
+- Inner loop: small-pop RevDE to tune a simple CPG (phases per actuator + global A, f).
+- No random-move probes; only two cheap gates that do NOT change objective:
+  (1) compile + actuator band check; (2) 0.2s zero-control stability sanity.
+- Biases and symmetry-aware operators on the three genotype vectors to increase viability.
+- Roulette-wheel parent selection, one-point crossover per vector, Gaussian mutation.
+- Genotype-level caching: if a body reappears, reuse its best fitness and CPG params.
+- Saves best body JSON and a short video rendered with its learned controller.
+
+You can toggle/elaborate budgets at the CONFIG section below.
 """
 
 from __future__ import annotations
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any
 
 import numpy as np
 import numpy.typing as npt
 import mujoco as mj
 
-# IMPORTANT: clear MuJoCo control callback immediately (prevents engine "Python exception"/segfault)
+# Clear any stale MuJoCo control callback
 try:
-    mj.set_mjcb_control(None)  # DO NOT REMOVE
+    mj.set_mjcb_control(None)
 except Exception:
     pass
 
@@ -27,88 +34,95 @@ from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import (
     save_graph_as_json,
 )
 from ariel.ec.genotypes.nde import NeuralDevelopmentalEncoding
-from ariel.simulation.controllers.controller import Controller
 from ariel.simulation.environments import OlympicArena
 from ariel.utils.runners import simple_runner
 from ariel.utils.tracker import Tracker
 from ariel.utils.video_recorder import VideoRecorder
 from ariel.utils.renderers import video_renderer
 
-# ========= Globals / config =========
+# ==================== CONFIG ====================
 SEED = 42
 RNG = np.random.default_rng(SEED)
 
+# EA (outer) params
+POP_SIZE = 10
+GENS = 5
+GENE_LEN = 64
+NUM_MODULES = 30
+
+# Controller limits / target & sim
+CONTROL_BOUND = np.pi / 2
+SIM_DURATION = 10.0              # rollout duration for fitness
+QUIET_TIME = 0.60                # start-up quiet phase to avoid initial shocks
+SPAWN_POS = [-0.8, 0, 0.1]       # per user request (no extra z-offset)
+TARGET_POSITION = np.array([5.0, 0.0, 0.5], dtype=np.float64)
+
+# Actuator band (quick viability gate, no secondary scoring)
+NU_MIN, NU_MAX = 4, 20
+
+# EA operators
+CROSSOVER_PROB = 0.80
+MUTATION_PROB = 0.10
+MUTATION_STD = 0.10
+
+# Symmetry options
+SYMMETRIZE_P = 0.10              # occasional pairwise symmetrization
+
+# Inner RevDE budgets
+REVDE_POP = 16
+REVDE_GENS = 12
+REVDE_F = 0.6                    # differential weight
+REVDE_CR = 0.7                   # crossover rate
+REVDE_SIM = 8.0                  # (seconds) inner-loop rollout (can be <= SIM_DURATION)
+
 # Paths
 CWD = Path.cwd()
-OUT = CWD / "__outer_ga__"
-(OUT / "videos").mkdir(parents=True, exist_ok=True)
+OUTPUT = CWD / "__output__"
+(OUTPUT / "videos").mkdir(parents=True, exist_ok=True)
 
-# Arena / task
-TARGET_POS = np.array([5.0, 0.0, 0.5])   # forward is +X in OlympicArena
-SPAWN_BASE = np.array([-0.8, 0.0, 0.10])
-SPAWN_Z_OFFSET = 0.20                    # lifted spawn to avoid interpenetration
+# =============== Helpers / hashing ===============
+def hash_genotype(gen: List[np.ndarray]) -> bytes:
+    parts = [np.ascontiguousarray(v).astype(np.float32).tobytes() for v in gen]
+    return b"|".join(parts)
 
-# NDE + genotype
-NUM_MODULES = 30
-GENE_LEN = 64     # per vector
-CHROMOSOMES = 3   # [type, connection, rotation]
-
-# GA
-POP = 120
-GENS = 40
-ELITES = 2
-TOURNAMENT_K = 4
-MUT_P = 0.12
-MUT_SIGMA = 0.12
-SIGMA_DRIFT = 0.10      # self-adaptive log-normal drift
-CROSSOVER_P = 0.80
-BLEND_XOVER_P = 0.20    # sometimes use arithmetic/blend xover (rot/type)
-CURRICULUM_GENS = 12    # use viability score for selection for first N gens
-
-# Viability filters / probes
-NU_MIN, NU_MAX = 4, 20
-RAND_PROBE_DUR = 1.0
-RAND_PROBE_STD = 0.02
-PROBE_DUR = 2.5
-VIAB_EPS1 = 0.01    # random-moves forward progress
-VIAB_EPS2 = 0.05    # gentle CPG forward progress
-
-# Final video/eval duration
-FINAL_DUR = 12.0
-
-# Caching
+# genotype -> cache: fitness + best controller params
 _eval_cache: Dict[bytes, Dict[str, Any]] = {}
 
-# Controller hygiene
-QUIET_TIME = 0.60
-CONTROL_BOUND = np.pi / 2
+# =============== Init with legal biases ===============
+def biased_random_genotype() -> List[np.ndarray]:
+    """Biased priors to improve actuator/connectivity emergence (still evolutionary & legal)."""
+    # type: bias upward (actuated modules more likely)
+    type_vec = np.clip(0.80 + 0.20 * RNG.standard_normal(GENE_LEN), 0.0, 1.0).astype(np.float32)
+    # connection: front-load density (decay across indices) + noise
+    base = np.power(0.85, np.arange(GENE_LEN, dtype=np.float32))
+    base = (base - base.min()) / (base.max() - base.min() + 1e-9)
+    conn_vec = np.clip(base + 0.15 * RNG.standard_normal(GENE_LEN), 0.0, 1.0).astype(np.float32)
+    # rotation: bimodal {0,1} + noise for bilateral hints
+    modes = RNG.integers(0, 2, size=GENE_LEN).astype(np.float32)
+    rot_vec = np.clip(modes + 0.18 * RNG.standard_normal(GENE_LEN), 0.0, 1.0).astype(np.float32)
+    return [type_vec, conn_vec, rot_vec]
 
-# ========= Helpers =========
-def hash_genotype(gen: List[np.ndarray]) -> bytes:
-    # Stable hashable key for caching
-    return b"|".join([np.ascontiguousarray(v).tobytes() for v in gen])
+# =============== GA operators ===============
+def one_point_crossover(a: np.ndarray, b: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    L = a.size
+    point = int(RNG.integers(1, L))
+    c1 = np.concatenate([a[:point], b[point:]]).astype(np.float32)
+    c2 = np.concatenate([b[:point], a[point:]]).astype(np.float32)
+    return c1, c2
 
-def init_biased_population(n: int) -> List[List[np.ndarray]]:
-    """Legal priors entirely in the three input vectors."""
-    pop: List[List[np.ndarray]] = []
-    for _ in range(n):
-        # type: bias toward hinge-able mix -> mean ~0.65 with noise
-        type_vec = np.clip(0.65 + 0.18 * RNG.standard_normal(GENE_LEN), 0.0, 1.0).astype(np.float32)
 
-        # connection: front-loaded (shorter connections early indices) + noise
-        base = np.power(0.90, np.arange(GENE_LEN, dtype=np.float32))  # decays with index
-        base = (base - base.min()) / (base.max() - base.min() + 1e-9)
-        conn_vec = np.clip(base + 0.12 * RNG.standard_normal(GENE_LEN), 0.0, 1.0).astype(np.float32)
+def crossover_per_chromosome(pa: List[np.ndarray], pb: List[np.ndarray]) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    child1, child2 = [], []
+    for idx in range(3):
+        if RNG.random() < CROSSOVER_PROB:
+            ca, cb = one_point_crossover(pa[idx], pb[idx])
+        else:
+            ca, cb = pa[idx].copy(), pb[idx].copy()
+        child1.append(ca); child2.append(cb)
+    return child1, child2
 
-        # rotation: bimodal around {0, 1} with noise -> encourages mirrored/symmetric
-        modes = RNG.integers(0, 2, size=GENE_LEN).astype(np.float32)
-        rot_vec = np.clip(modes + 0.18 * RNG.standard_normal(GENE_LEN), 0.0, 1.0).astype(np.float32)
 
-        pop.append([type_vec, conn_vec, rot_vec])
-    return pop
-
-def symmetrize_pairs(vec: np.ndarray, p: float = 0.10) -> np.ndarray:
-    """Occasionally average index i with its 'mirror' (midpoint pairing)."""
+def symmetrize_pairs(vec: np.ndarray, p: float = SYMMETRIZE_P) -> np.ndarray:
     L = vec.size
     out = vec.copy()
     if RNG.random() < p:
@@ -118,8 +132,8 @@ def symmetrize_pairs(vec: np.ndarray, p: float = 0.10) -> np.ndarray:
             out[i] = m; out[j] = m
     return out
 
+
 def symmetry_aware_mutation(vec: np.ndarray, mut_p: float, sigma: float) -> np.ndarray:
-    """Same noise to mirrored indices to preserve bilateral features."""
     L = vec.size
     out = vec.copy()
     for i in range(L // 2):
@@ -133,309 +147,317 @@ def symmetry_aware_mutation(vec: np.ndarray, mut_p: float, sigma: float) -> np.n
         out[mid] = np.clip(out[mid] + RNG.normal(0.0, sigma), 0.0, 1.0)
     return out.astype(np.float32)
 
-def crossover_one_point(a: np.ndarray, b: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    L = a.size
-    point = int(RNG.integers(1, L))
-    return (np.concatenate([a[:point], b[point:]]).astype(np.float32),
-            np.concatenate([b[:point], a[point:]]).astype(np.float32))
 
-def crossover_blend(a: np.ndarray, b: np.ndarray, alpha: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
-    lam = RNG.uniform(0.3, 0.7) if alpha == 0.5 else alpha
-    c1 = np.clip(lam * a + (1 - lam) * b, 0.0, 1.0).astype(np.float32)
-    c2 = np.clip(lam * b + (1 - lam) * a, 0.0, 1.0).astype(np.float32)
-    return c1, c2
+def gaussian_mutation(gen: List[np.ndarray]) -> List[np.ndarray]:
+    mutated = []
+    for chrom in gen:
+        # standard per-gene mutate mask, then enforce symmetry-aware coupling
+        to_mut = RNG.random(chrom.shape) < MUTATION_PROB
+        noise = RNG.normal(loc=0.0, scale=MUTATION_STD, size=chrom.shape).astype(np.float32)
+        new_chrom = np.clip(chrom + noise * to_mut, 0.0, 1.0)
+        new_chrom = symmetry_aware_mutation(new_chrom, mut_p=0.05, sigma=MUTATION_STD)
+        new_chrom = symmetrize_pairs(new_chrom)
+        mutated.append(new_chrom.astype(np.float32))
+    return mutated
 
-def build_graph(gen: List[np.ndarray]):
+# =============== Decode & build ===============
+def decode_and_build(genotype: List[np.ndarray]):
     nde = NeuralDevelopmentalEncoding(number_of_modules=NUM_MODULES)
-    p_type, p_conn, p_rot = nde.forward(gen)
+    p_type, p_conn, p_rot = nde.forward(genotype)
     hpd = HighProbabilityDecoder(NUM_MODULES)
-    return hpd.probability_matrices_to_graph(p_type, p_conn, p_rot)
-
-def _spawn_world(robot_graph, z_off: float):
+    robot_graph = hpd.probability_matrices_to_graph(p_type, p_conn, p_rot)
     core = construct_mjspec_from_graph(robot_graph)
+    return robot_graph, core
+
+# =============== Fitness ===============
+def fitness_function(history: list[Tuple[float, float, float]]) -> float:
+    """Negative Euclidean distance to TARGET_POSITION (maximization)."""
+    if not history:
+        return -1e6
+    xc, yc, zc = history[-1]
+    diff = TARGET_POSITION - np.array([xc, yc, zc], dtype=np.float64)
+    return -float(np.linalg.norm(diff))
+
+# =============== Zero-control stability sanity ===============
+def zero_control_stability(model: mj.MjModel, data: mj.MjData, duration: float = 0.2) -> bool:
+    """Run a very short sim with zero control; return False if it NaNs/explodes."""
+    mj.set_mjcb_control(None)
+    def cb(m: mj.MjModel, d: mj.MjData):
+        if m.nu:
+            d.ctrl[:] = 0.0
+    mj.set_mjcb_control(cb)
+    try:
+        simple_runner(model, data, duration=duration, steps_per_loop=40)
+    except Exception:
+        return False
+    if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
+        return False
+    return True
+
+# =============== Inner RevDE (CPG) ===============
+
+def make_controller_callback(model: mj.MjModel, phases: np.ndarray, A: float, freq_hz: float):
+    """Return a MuJoCo control callback implementing the CPG with given params."""
+    nu = int(model.nu)
+    phases = phases.astype(np.float64)
+    A = float(np.clip(A, 0.0, CONTROL_BOUND))
+    FREQ_HZ = float(np.clip(freq_hz, 0.3, 1.0))
+    OMEGA = 2.0 * np.pi * FREQ_HZ
+
+    def cb(m: mj.MjModel, d: mj.MjData):
+        if d.time < QUIET_TIME:
+            if m.nu:
+                d.ctrl[:] = 0.0
+            return
+        t = d.time - QUIET_TIME
+        # per-actuator sine with phase offsets
+        u = A * np.sin(OMEGA * t + phases)
+        np.clip(u, -CONTROL_BOUND, CONTROL_BOUND, out=u)
+        d.ctrl[:] = u
+    return cb
+
+
+def clamp_params(phases: np.ndarray, A: float, f: float) -> Tuple[np.ndarray, float, float]:
+    # wrap phases to [0, 2π)
+    phases = np.mod(phases, 2.0 * np.pi)
+    A = float(np.clip(A, 0.0, CONTROL_BOUND))
+    f = float(np.clip(f, 0.3, 1.0))
+    return phases, A, f
+
+
+def revde_optimize_cpg(spec, model: mj.MjModel,
+                       sim_seconds: float = REVDE_SIM) -> Tuple[float, Dict[str, Any]]:
+    """Small-pop RevDE optimizing phases (per-actuator) + global amplitude + frequency.
+    Returns (best_fitness, {phases, A, f}).
+    Note: Creates a fresh Tracker and MjData per candidate to avoid binding issues.
+    """
+    nu = int(model.nu)
+    if nu == 0:
+        return -1e6, {"phases": np.zeros(0), "A": 0.0, "f": 0.7}
+
+    D = nu + 2  # phases per actuator + (A, f)
+
+    # Bounds / initialization
+    def init_individual():
+        phases0 = RNG.uniform(0.0, 2.0*np.pi, size=nu).astype(np.float64)
+        A0 = float(RNG.uniform(0.2, 0.8) * CONTROL_BOUND)
+        f0 = float(RNG.uniform(0.4, 0.9))
+        return np.concatenate([phases0, np.array([A0, f0])]).astype(np.float64)
+
+    pop = np.stack([init_individual() for _ in range(REVDE_POP)], axis=0)
+
+    def evaluate(vec: np.ndarray) -> float:
+        phases = vec[:nu].copy()
+        A, f = float(vec[-2]), float(vec[-1])
+        phases, A, f = clamp_params(phases, A, f)
+
+        # fresh data + tracker per evaluation
+        data = mj.MjData(model)
+        mj.mj_resetData(model, data)
+        local_tracker = Tracker(mj.mjtObj.mjOBJ_GEOM, "core")
+        local_tracker.setup(spec, data)
+
+        mj.set_mjcb_control(None)
+        cb = make_controller_callback(model, phases, A, f)
+        mj.set_mjcb_control(cb)
+
+        try:
+            simple_runner(model, data, duration=sim_seconds, steps_per_loop=80)
+        except Exception:
+            return -1e6
+
+        xpos = local_tracker.history.get("xpos", {}).get(0, [])
+        return fitness_function(xpos)
+
+    fitness = np.array([evaluate(ind) for ind in pop], dtype=np.float64)
+
+    for _ in range(REVDE_GENS):
+        best_idx = int(np.argmax(fitness))
+        best = pop[best_idx]
+        new_pop = pop.copy()
+        new_fit = fitness.copy()
+        for i in range(REVDE_POP):
+            # choose r1, r2 distinct from i
+            idxs = [j for j in range(REVDE_POP) if j != i]
+            r1, r2 = RNG.choice(idxs, size=2, replace=False)
+            vi = pop[i] + REVDE_F * (best - pop[i]) + REVDE_F * (pop[r1] - pop[r2])
+            # binomial crossover
+            cross_mask = RNG.random(D) < REVDE_CR
+            if not cross_mask.any():
+                cross_mask[RNG.integers(0, D)] = True
+            trial = np.where(cross_mask, vi, pop[i])
+            fit_trial = evaluate(trial)
+            if fit_trial > fitness[i]:
+                new_pop[i] = trial
+                new_fit[i] = fit_trial
+        pop, fitness = new_pop, new_fit
+
+    best_idx = int(np.argmax(fitness))
+    best_vec = pop[best_idx]
+    phases = best_vec[:nu].copy()
+    A, f = float(best_vec[-2]), float(best_vec[-1])
+    phases, A, f = clamp_params(phases, A, f)
+    return float(fitness[best_idx]), {"phases": phases, "A": A, "f": f}
+
+# =============== Evaluate a genotype (single objective) ===============
+ #(single objective) ===============
+def evaluate_genotype(genotype: List[np.ndarray]) -> Tuple[float, list, Dict[str, Any]]:
+    key = hash_genotype(genotype)
+    if key in _eval_cache:
+        c = _eval_cache[key]
+        return c["fitness"], c.get("history", []), c.get("ctrl", {})
+
+    # Decode & compile
+    try:
+        robot_graph, core = decode_and_build(genotype)
+        world = OlympicArena()
+        world.spawn(core.spec, spawn_position=SPAWN_POS)
+        model = world.spec.compile()
+        data = mj.MjData(model)
+        mj.mj_resetData(model, data)
+    except Exception:
+        _eval_cache[key] = {"fitness": -1e6}
+        return -1e6, [], {}
+
+    # Actuator band gate
+    nu = int(model.nu)
+    if nu < NU_MIN or nu > NU_MAX:
+        _eval_cache[key] = {"fitness": -1e6}
+        return -1e6, [], {}
+
+    # Zero-control stability sanity (very cheap)
+    if not zero_control_stability(model, data, duration=0.2):
+        _eval_cache[key] = {"fitness": -1e6}
+        return -1e6, [], {}
+
+    # Inner RevDE to get controller params and best fitness (single score)
+    best_fit, ctrl_params = revde_optimize_cpg(world.spec, model, sim_seconds=REVDE_SIM)
+
+    # Optional: final short full-duration confirmation rollout for history (uses learned params)
+    phases = ctrl_params.get("phases", np.zeros(nu))
+    A = ctrl_params.get("A", 0.4 * CONTROL_BOUND)
+    f = ctrl_params.get("f", 0.7)
+    phases, A, f = clamp_params(phases, A, f)
+
+    mj.set_mjcb_control(None)
+    data2 = mj.MjData(model)
+    mj.mj_resetData(model, data2)
+    tracker2 = Tracker(mj.mjtObj.mjOBJ_GEOM, "core")
+    tracker2.setup(world.spec, data2)
+    cb = make_controller_callback(model, phases, A, f)
+    mj.set_mjcb_control(cb)
+    try:
+        simple_runner(model, data2, duration=SIM_DURATION, steps_per_loop=80)
+    except Exception:
+        pass
+
+    hist = tracker2.history.get("xpos", {}).get(0, [])
+    fit_final = fitness_function(hist) if hist else best_fit
+
+    rec = {
+        "fitness": fit_final,
+        "history": hist,
+        "ctrl": ctrl_params,
+        "robot_graph": robot_graph,
+        "core": core,
+    }
+    _eval_cache[key] = rec
+    return fit_final, hist, ctrl_params
+
+# =============== EA main loop ===============
+def run_ea():
+    mj.set_mjcb_control(None)
+    population = [biased_random_genotype() for _ in range(POP_SIZE)]
+
+    fitnesses: List[float] = []
+    histories: List[list] = []
+    ctrls: List[Dict[str, Any]] = []
+
+    for i, gen in enumerate(population):
+        fit, his, ctrl = evaluate_genotype(gen)
+        fitnesses.append(fit); histories.append(his); ctrls.append(ctrl)
+
+    for gen_idx in range(GENS):
+        print(f"=== Generation {gen_idx+1} ===")
+
+        # roulette-wheel selection probabilities
+        f_arr = np.array(fitnesses, dtype=np.float64)
+        weights = f_arr - f_arr.min() + 1e-9
+        probs = weights / max(weights.sum(), 1e-9)
+
+        # produce children
+        children: List[List[np.ndarray]] = []
+        while len(children) < POP_SIZE:
+            pa, pb = RNG.choice(len(population), size=2, replace=False, p=probs)
+            c1, c2 = crossover_per_chromosome(population[pa], population[pb])
+            children.append(gaussian_mutation(c1))
+            if len(children) < POP_SIZE:
+                children.append(gaussian_mutation(c2))
+
+        # evaluate children
+        child_fits: List[float] = []
+        child_hists: List[list] = []
+        child_ctrls: List[Dict[str, Any]] = []
+        for chi in children:
+            fit, his, ctrl = evaluate_genotype(chi)
+            child_fits.append(fit); child_hists.append(his); child_ctrls.append(ctrl)
+
+        # elitist survivor selection (mu+lambda) → keep best POP_SIZE
+        combined = population + children
+        combined_fit = fitnesses + child_fits
+        combined_hist = histories + child_hists
+        combined_ctrl = ctrls + child_ctrls
+        order = np.argsort(combined_fit)[::-1][:POP_SIZE]
+        population = [combined[i] for i in order]
+        fitnesses = [combined_fit[i] for i in order]
+        histories = [combined_hist[i] for i in order]
+        ctrls = [combined_ctrl[i] for i in order]
+
+        print("Survivors (top -> bottom):")
+        for r, f in enumerate(fitnesses):
+            print(f"{r+1}: {f:.4f}")
+
+    # Best individual
+    best_idx = int(np.argmax(fitnesses))
+    best_gen, best_hist, best_fit, best_ctrl = (
+        population[best_idx], histories[best_idx], fitnesses[best_idx], ctrls[best_idx]
+    )
+    print("=== EA finished ===")
+    print(f"Best fitness: {best_fit:.4f}")
+
+    # Save best robot JSON
+    robot_graph, core = decode_and_build(best_gen)
+    out_json = OUTPUT / "best_robot.json"
+    save_graph_as_json(robot_graph, out_json)
+    print(f"Saved best robot graph to {out_json}")
+
+    # Save best video with learned controller
+    mj.set_mjcb_control(None)
     world = OlympicArena()
-    spawn = SPAWN_BASE + np.array([0.0, 0.0, z_off])
-    world.spawn(core.spec, spawn_position=spawn.tolist())
+    world.spawn(core.spec, spawn_position=SPAWN_POS)
     model = world.spec.compile()
     data = mj.MjData(model)
     mj.mj_resetData(model, data)
-    return world, model, data
-
-# ========= Probes & fitness =========
-def random_moves_probe(robot_graph) -> float:
-    """Tiny random sinusoid per actuator, QUIET start."""
-    mj.set_mjcb_control(None)
-    world, model, data = _spawn_world(robot_graph, SPAWN_Z_OFFSET)
-    if model.nu == 0: return 0.0
-
-    phases = RNG.uniform(0, 2*np.pi, size=model.nu)
-    def cb(m: mj.MjModel, d: mj.MjData):
-        if d.time < QUIET_TIME: 
-            if m.nu: d.ctrl[:] = 0.0
-            return
-        u = RAND_PROBE_STD * np.sin(2*np.pi*0.6*(d.time - QUIET_TIME) + phases)
-        np.clip(u, -CONTROL_BOUND, CONTROL_BOUND, out=u)
-        d.ctrl[:] = u
-    mj.set_mjcb_control(cb)
 
     tracker = Tracker(mj.mjtObj.mjOBJ_GEOM, "core")
     tracker.setup(world.spec, data)
 
-    try:
-        simple_runner(model, data, duration=RAND_PROBE_DUR, steps_per_loop=40)
-    except Exception:
-        return 0.0
+    nu = int(model.nu)
+    phases = np.zeros(nu) if not best_ctrl else best_ctrl.get("phases", np.zeros(nu))
+    A = CONTROL_BOUND * 0.4 if not best_ctrl else best_ctrl.get("A", CONTROL_BOUND*0.4)
+    f = 0.7 if not best_ctrl else best_ctrl.get("f", 0.7)
+    phases, A, f = clamp_params(phases, A, f)
 
-    xpos = tracker.history.get("xpos", {}).get(0, [])
-    if len(xpos) == 0: return 0.0
-    x0 = xpos[0][0]
-    return max(p[0]-x0 for p in xpos)
-
-def gentle_cpg_probe(robot_graph) -> float:
-    """Alternating phases, very small amplitude, QUIET + ramp."""
-    mj.set_mjcb_control(None)
-    world, model, data = _spawn_world(robot_graph, SPAWN_Z_OFFSET)
-    if model.nu == 0: return 0.0
-    nu = model.nu
-
-    A = 0.01 * CONTROL_BOUND
-    PHI = np.where((np.arange(nu) % 2) == 0, 0.0, np.pi)
-    FREQ = 0.4
-    RAMP = 0.10
-
-    def cb(m: mj.MjModel, d: mj.MjData):
-        if d.time < QUIET_TIME:
-            if m.nu: d.ctrl[:] = 0.0
-            return
-        t = d.time - QUIET_TIME
-        A_t = A * (1.0 - np.exp(-RAMP * t))
-        u = A_t * np.sin(2*np.pi*FREQ*t + PHI)
-        np.clip(u, -CONTROL_BOUND, CONTROL_BOUND, out=u)
-        d.ctrl[:] = u
+    cb = make_controller_callback(model, phases, A, f)
     mj.set_mjcb_control(cb)
 
-    tracker = Tracker(mj.mjtObj.mjOBJ_GEOM, "core")
-    tracker.setup(world.spec, data)
+    video_folder = OUTPUT / "videos"
+    recorder = VideoRecorder(output_folder=str(video_folder))
+    video_renderer(model, data, duration=SIM_DURATION, video_recorder=recorder)
+    print(f"Saved video of best robot to {video_folder}")
 
-    try:
-        simple_runner(model, data, duration=PROBE_DUR, steps_per_loop=40)
-    except Exception:
-        return 0.0
+    return best_gen, best_hist, best_fit
 
-    xpos = tracker.history.get("xpos", {}).get(0, [])
-    if len(xpos) == 0: return 0.0
-    x0 = xpos[0][0]
-    return max(p[0]-x0 for p in xpos)
-
-def true_fitness(robot_graph, duration: float = FINAL_DUR) -> float:
-    """Assignment fitness (negative distance to TARGET_POS) using a slightly stronger CPG for evaluation only."""
-    mj.set_mjcb_control(None)
-    world, model, data = _spawn_world(robot_graph, SPAWN_Z_OFFSET)
-    if model.nu == 0: return -1e6
-    nu = model.nu
-
-    # Safe global-CPG for evaluation (still gentle)
-    A = 0.30 * CONTROL_BOUND
-    FREQ = 0.7
-    RAMP = 0.8
-    PHASES = 2*np.pi * np.arange(nu)/max(1,nu)
-
-    def cb(m: mj.MjModel, d: mj.MjData):
-        if d.time < QUIET_TIME:
-            if m.nu: d.ctrl[:] = 0.0; return
-        t = d.time - QUIET_TIME
-        A_t = A*(1 - np.exp(-RAMP*t))
-        u = A_t * np.sin(2*np.pi*FREQ*t + PHASES)
-        np.clip(u, -CONTROL_BOUND, CONTROL_BOUND, out=u)
-        d.ctrl[:] = u
-    mj.set_mjcb_control(cb)
-
-    tracker = Tracker(mj.mjtObj.mjOBJ_GEOM, "core")
-    tracker.setup(world.spec, data)
-
-    try:
-        simple_runner(model, data, duration=duration, steps_per_loop=80)
-    except Exception:
-        return -1e6
-
-    hist = tracker.history.get("xpos", {}).get(0, [])
-    if len(hist) == 0: return -1e6
-    end = np.array(hist[-1])
-    return -float(np.linalg.norm(TARGET_POS - end))
-
-# ========= Viability evaluation with caching =========
-def evaluate_viability(gen: List[np.ndarray]) -> Dict[str, Any]:
-    key = hash_genotype(gen)
-    if key in _eval_cache:
-        return _eval_cache[key]
-
-    result = {
-        "nu": 0,
-        "static_ok": False,
-        "rand_prog": 0.0,
-        "probe_prog": 0.0,
-        "viab_score": 0.0,
-        "fitness": -1e6,
-        "robot_graph": None,
-    }
-
-    # Decode -> static checks
-    try:
-        robot_graph = build_graph(gen)
-        result["robot_graph"] = robot_graph
-    except Exception:
-        _eval_cache[key] = result
-        return result
-
-    # compile once to read nu
-    try:
-        world, model, _ = _spawn_world(robot_graph, SPAWN_Z_OFFSET)
-        nu = int(model.nu)
-    except Exception:
-        _eval_cache[key] = result
-        return result
-
-    result["nu"] = nu
-    if not (NU_MIN <= nu <= NU_MAX):
-        _eval_cache[key] = result
-        return result
-    result["static_ok"] = True
-
-    # Random-moves probe
-    rp = random_moves_probe(robot_graph)
-    result["rand_prog"] = rp
-    if rp < VIAB_EPS1:
-        _eval_cache[key] = result
-        return result
-
-    # Gentle CPG probe
-    gp = gentle_cpg_probe(robot_graph)
-    result["probe_prog"] = gp
-    if gp < VIAB_EPS2:
-        _eval_cache[key] = result
-        return result
-
-    # Viability score (simple blend; can be tuned)
-    result["viab_score"] = 0.4 * rp + 0.6 * gp
-
-    # True fitness (still cheap fixed CPG; later swap for inner CPG+DE best fit)
-    result["fitness"] = true_fitness(robot_graph, duration=FINAL_DUR)
-
-    _eval_cache[key] = result
-    return result
-
-# ========= GA operators =========
-def parents_tournament(pop: List[List[np.ndarray]], scores: np.ndarray, k: int) -> Tuple[int, int]:
-    cand = RNG.choice(len(pop), size=(2, k), replace=False)
-    i = cand[0, np.argmax(scores[cand[0]])]
-    j = cand[1, np.argmax(scores[cand[1]])]
-    return int(i), int(j)
-
-def make_children(pa: List[np.ndarray], pb: List[np.ndarray]) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-    child1, child2 = [], []
-    for idx in range(CHROMOSOMES):
-        a, b = pa[idx], pb[idx]
-        if RNG.random() < CROSSOVER_P:
-            if idx != 1 and RNG.random() < BLEND_XOVER_P:  # blend occasionally (type/rot)
-                ca, cb = crossover_blend(a, b)
-            else:
-                ca, cb = crossover_one_point(a, b)
-        else:
-            ca, cb = a.copy(), b.copy()
-
-        # symmetry-aware mutation with self-adaptive sigma
-        # drift sigma per vector
-        sigma = MUT_SIGMA * np.exp(SIGMA_DRIFT * RNG.standard_normal())
-        ca = symmetry_aware_mutation(ca, MUT_P, sigma)
-        cb = symmetry_aware_mutation(cb, MUT_P, sigma)
-
-        # occasional symmetrize
-        ca = symmetrize_pairs(ca, p=0.10)
-        cb = symmetrize_pairs(cb, p=0.10)
-
-        child1.append(ca)
-        child2.append(cb)
-    return child1, child2
-
-# ========= Main loop =========
-def run_outer_ga():
-    print("=== Outer GA: viable body evolution ===")
-    population = init_biased_population(POP)
-
-    # Evaluate initial pop
-    evals = [evaluate_viability(ind) for ind in population]
-    for g in range(GENS):
-        print(f"\n-- Gen {g+1}/{GENS} --")
-        # Selection score: curriculum (viability score first, then true fitness)
-        if g < CURRICULUM_GENS:
-            sel_scores = np.array([e["viab_score"] for e in evals], dtype=np.float64)
-        else:
-            sel_scores = np.array([e["fitness"] for e in evals], dtype=np.float64)
-
-        # Replace -inf/very bad with tiny to keep tournaments working
-        if not np.isfinite(sel_scores).all():
-            sel_scores[~np.isfinite(sel_scores)] = -1e6
-
-        # Elitism
-        elite_idx = np.argsort(sel_scores)[::-1][:ELITES]
-        new_pop = [population[i] for i in elite_idx]
-        new_evals = [evals[i] for i in elite_idx]
-
-        # Fill the rest with children
-        while len(new_pop) < POP:
-            i, j = parents_tournament(population, sel_scores, TOURNAMENT_K)
-            c1, c2 = make_children(population[i], population[j])
-            new_pop.append(c1)
-            if len(new_pop) < POP:
-                new_pop.append(c2)
-
-        # Evaluate
-        evals_children = [evaluate_viability(ind) for ind in new_pop[ELITES:]]
-        evals = new_evals + evals_children
-        population = new_pop
-
-        # Log survivors (top 10)
-        score_name = "viab_score" if g < CURRICULUM_GENS else "fitness"
-        sc = np.array([e[score_name] for e in evals])
-        order = np.argsort(sc)[::-1]
-        print(f"Top 10 by {score_name}:")
-        for r in order[:10]:
-            e = evals[r]
-            print(f"  {e[score_name]: .4f} | nu={e['nu']}  rand={e['rand_prog']:.3f}  probe={e['probe_prog']:.3f}")
-
-    # Final selection by true fitness
-    final_scores = np.array([e["fitness"] for e in evals])
-    best_idx = int(np.argmax(final_scores))
-    best_ind = population[best_idx]
-    best_eval = evals[best_idx]
-    print("\n=== GA complete ===")
-    print(f"Best true fitness: {best_eval['fitness']:.4f} | nu={best_eval['nu']} | probe={best_eval['probe_prog']:.3f}")
-
-    # Save JSON + video
-    robot_graph = best_eval["robot_graph"]
-    save_graph_as_json(robot_graph, OUT / "best_robot.json")
-    print(f"Saved best robot graph to {OUT/'best_robot.json'}")
-
-    # Video (same controller as true_fitness)
-    mj.set_mjcb_control(None)
-    world, model, data = _spawn_world(robot_graph, SPAWN_Z_OFFSET)
-    nu = model.nu
-    A = 0.30 * CONTROL_BOUND; FREQ = 0.7; RAMP = 0.8
-    PHASES = 2*np.pi * np.arange(nu)/max(1,nu)
-
-    def eval_cb(m: mj.MjModel, d: mj.MjData):
-        if d.time < QUIET_TIME:
-            if m.nu: d.ctrl[:] = 0.0; return
-        t = d.time - QUIET_TIME
-        A_t = A*(1 - np.exp(-RAMP*t))
-        u = A_t * np.sin(2*np.pi*FREQ*t + PHASES)
-        np.clip(u, -CONTROL_BOUND, CONTROL_BOUND, out=u)
-        d.ctrl[:] = u
-    mj.set_mjcb_control(eval_cb)
-
-    recorder = VideoRecorder(output_folder=str(OUT / "videos"))
-    video_renderer(model, data, duration=FINAL_DUR, video_recorder=recorder)
-    print(f"Saved video in {OUT/'videos'}")
 
 if __name__ == "__main__":
-    run_outer_ga()
+    run_ea()
