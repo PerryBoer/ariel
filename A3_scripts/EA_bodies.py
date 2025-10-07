@@ -36,8 +36,8 @@ SEED = 42
 RNG = np.random.default_rng(SEED)
 
 ### EA parameters
-POP_SIZE = 5
-GENS = 3
+POP_SIZE = 10
+GENS = 5
 GENE_LEN = 64
 SIM_DURATION = 10.0
 MUTATION_STD = 0.1
@@ -57,22 +57,34 @@ def nn_controller(
     model: mj.MjModel,
     data: mj.MjData,
 ) -> npt.NDArray[np.float64]:
-    """NU NOG NN_CONTROLLER, VERVANGEN MET CPG"""
-    input_size = len(data.qpos)
-    hidden_size = 8
-    output_size = model.nu
+    """
+    Minimal fixed-parameter CPG (global sine) controller.
+    - No evolvable controller params (constants only).
+    - Deterministic phase offsets per actuator index.
+    - Actions clipped to [-pi/2, pi/2] per assignment.
+    """
+    nu: int = model.nu
+    t: float = float(data.time)
 
-    w1 = RNG.normal(loc=0.0138, scale=0.5, size=(input_size, hidden_size))
-    w2 = RNG.normal(loc=0.0138, scale=0.5, size=(hidden_size, hidden_size))
-    w3 = RNG.normal(loc=0.0138, scale=0.5, size=(hidden_size, output_size))
+    # ---- Fixed CPG constants (NOT evolved) ----
+    CONTROL_BOUND = np.pi / 2              # required action bound
+    A = 0.6 * CONTROL_BOUND                # amplitude (conservative to avoid saturation)
+    FREQ_HZ = 0.7                          # gait frequency in Hz
+    OMEGA = 2.0 * np.pi * FREQ_HZ          # rad/s
+    BIAS = 0.0                             # center offset
 
-    inputs = data.qpos
+    if nu == 0:
+        return np.zeros(0, dtype=np.float64)
 
-    layer1 = np.tanh(np.dot(inputs, w1))
-    layer2 = np.tanh(np.dot(layer1, w2))
-    outputs = np.tanh(np.dot(layer2, w3))
+    # Evenly spaced phase offsets over actuators (deterministic)
+    phases = 2.0 * np.pi * (np.arange(nu, dtype=np.float64) / nu)
 
-    return outputs * np.pi
+    # CPG signal per actuator
+    u = A * np.sin(OMEGA * t + phases) + BIAS
+
+    # Enforce assignment-mandated bounds
+    np.clip(u, -CONTROL_BOUND, CONTROL_BOUND, out=u)
+    return u
 
 ### genotype functions
 def random_genotype() -> List[np.ndarray]:
