@@ -1,33 +1,50 @@
 """
-Outer GA + Inner RevDE (single-script, single fitness)
-- Operates ONLY on the three NDE input vectors (type, connection, rotation).
-- One objective only: negative distance to TARGET_POSITION after rollout.
-- Inner loop: small-pop RevDE to tune a simple CPG (phases per actuator + global A, f).
-- No random-move probes; only two cheap gates that do NOT change objective:
-  (1) compile + actuator band check; (2) 0.2s zero-control stability sanity.
-- Biases and symmetry-aware operators on the three genotype vectors to increase viability.
-- Roulette-wheel parent selection, one-point crossover per vector, Gaussian mutation.
-- Genotype-level caching: if a body reappears, reuse its best fitness and CPG params.
-- Saves best body JSON and a short video rendered with its learned controller.
+Assignment 3 — Co-evolution with EvoTorch (outer) + Nevergrad CMA (inner CPG)
 
-You can toggle/elaborate budgets at the CONFIG section below.
+WHAT'S NEW (vs your A3 template):
+- Outer loop: EvoTorch GA evolves ONLY the three NDE input vectors (3 x 64, in [0,1]).
+- Inner loop: Per-body controller training via Nevergrad CMA-ES on an enhanced CPG parametrization
+  (per-actuator phases + per-actuator amplitude + per-actuator bias + global frequency),
+  actions clipped to ±π/2.
+- Single fitness ONLY: negative distance to TARGET_POSITION after rollout.
+- Cheap viability gates (do not change the objective): actuator band check, and 0.2s zero-control sanity.
+- Caching: same genotype → reuse best learned fitness and controller params.
+- GA: boosted exploration (uniform crossover + mutation + random immigrants).
+- NDE/HPD are instantiated ONCE for the whole run so genotype→phenotype mapping is stable.
+- Pure pruning: we never edit graphs; unbuildable bodies get a very poor fitness.
+- Saving: reuse the cached graph that actually built during evolution.
+- End: saves best robot JSON at __output__/robot_graph.json and a video in __output__/videos/.
+
+Dependencies:
+  pip install evotorch nevergrad
 """
 
 from __future__ import annotations
 from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import Any, Dict, List, Tuple
 
+# Third-party
 import numpy as np
 import numpy.typing as npt
 import mujoco as mj
+import inspect
+import random
+import copy
+import hashlib
 
-# Clear any stale MuJoCo control callback
-try:
-    mj.set_mjcb_control(None)
-except Exception:
-    pass
+# EvoTorch outer EA
+from evotorch import Problem, Solution
+from evotorch.algorithms import GeneticAlgorithm
+from evotorch.operators import Operator
+from evotorch.core import SolutionBatch
 
-# ---------- ARIEL imports ----------
+# torch
+import torch
+
+# Inner-loop optimizer (CMA-ES)
+import nevergrad as ng
+
+# --- ARIEL imports (unchanged) ---
 from ariel.body_phenotypes.robogen_lite.constructor import construct_mjspec_from_graph
 from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import (
     HighProbabilityDecoder,
@@ -40,148 +57,75 @@ from ariel.utils.tracker import Tracker
 from ariel.utils.video_recorder import VideoRecorder
 from ariel.utils.renderers import video_renderer
 
-# ==================== CONFIG ====================
+# ========= Config =========
 SEED = 42
 RNG = np.random.default_rng(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
-# EA (outer) params
-POP_SIZE = 10
-GENS = 5
-GENE_LEN = 64
-NUM_MODULES = 30
-
-# Controller limits / target & sim
-CONTROL_BOUND = np.pi / 2
-SIM_DURATION = 10.0              # rollout duration for fitness
-QUIET_TIME = 0.60                # start-up quiet phase to avoid initial shocks
-SPAWN_POS = [-0.8, 0, 0.1]       # per user request (no extra z-offset)
+# World / task
+SPAWN_POS = [-0.8, 0, 0.1]
 TARGET_POSITION = np.array([5.0, 0.0, 0.5], dtype=np.float64)
+NUM_OF_MODULES = 30
 
-# Actuator band (quick viability gate, no secondary scoring)
-NU_MIN, NU_MAX = 4, 20
+# Genotype (body) = three 64-dim vectors in [0,1]
+GENE_LEN = 64
+CHROMOSOMES = 3
+BOUNDS = (0.0, 1.0)
 
-# EA operators
-CROSSOVER_PROB = 0.80
-MUTATION_PROB = 0.10
-MUTATION_STD = 0.10
+# Outer GA  << exploration (tune up when stable)
+POP_SIZE = 10            # try 50–100 when sims are stable/time allows
+NGENS = 50
+TOURNAMENT_K = 2
+CROSSOVER_RATE = 0.8     # we also add an explicit uniform crossover operator
+MUT_P = 0.30
+MUT_SIGMA = 0.25
 
-# Symmetry options
-SYMMETRIZE_P = 0.10              # occasional pairwise symmetrization
+# Viability gates (no change to objective)
+NU_MIN, NU_MAX = 2, 20          # <-- widened lower bound from 4→2 to avoid pruning borderline bodies
+ZERO_STAB_SEC = 0.2
 
-# Inner RevDE budgets
-REVDE_POP = 16
-REVDE_GENS = 12
-REVDE_F = 0.6                    # differential weight
-REVDE_CR = 0.7                   # crossover rate
-REVDE_SIM = 8.0                  # (seconds) inner-loop rollout (can be <= SIM_DURATION)
+# Simulation
+CONTROL_BOUND = np.pi / 2
+QUIET_TIME = 0.60
+SIM_DURATION = 10.0     # final rollout (fitness and video)
+INNER_SIM = 6.0         # inner-loop rollout per CMA candidate (shorter is faster)
 
-# Paths
+# Inner CMA-ES budgets (per body)
+CMA_BUDGET_EVALS = 20   # try 60–120 when stable
+CMA_WORKERS = 1         # MuJoCo safer per-process
+
+# I/O
 CWD = Path.cwd()
-OUTPUT = CWD / "__output__"
-(OUTPUT / "videos").mkdir(parents=True, exist_ok=True)
+OUT = CWD / "__output__"
+(OUT / "videos").mkdir(parents=True, exist_ok=True)
 
-# =============== Helpers / hashing ===============
-def hash_genotype(gen: List[np.ndarray]) -> bytes:
-    parts = [np.ascontiguousarray(v).astype(np.float32).tobytes() for v in gen]
-    return b"|".join(parts)
-
-# genotype -> cache: fitness + best controller params
-_eval_cache: Dict[bytes, Dict[str, Any]] = {}
-
-# =============== Init with legal biases ===============
-def biased_random_genotype() -> List[np.ndarray]:
-    """Biased priors to improve actuator/connectivity emergence (still evolutionary & legal)."""
-    # type: bias upward (actuated modules more likely)
-    type_vec = np.clip(0.80 + 0.20 * RNG.standard_normal(GENE_LEN), 0.0, 1.0).astype(np.float32)
-    # connection: front-load density (decay across indices) + noise
-    base = np.power(0.85, np.arange(GENE_LEN, dtype=np.float32))
-    base = (base - base.min()) / (base.max() - base.min() + 1e-9)
-    conn_vec = np.clip(base + 0.15 * RNG.standard_normal(GENE_LEN), 0.0, 1.0).astype(np.float32)
-    # rotation: bimodal {0,1} + noise for bilateral hints
-    modes = RNG.integers(0, 2, size=GENE_LEN).astype(np.float32)
-    rot_vec = np.clip(modes + 0.18 * RNG.standard_normal(GENE_LEN), 0.0, 1.0).astype(np.float32)
-    return [type_vec, conn_vec, rot_vec]
-
-# =============== GA operators ===============
-def one_point_crossover(a: np.ndarray, b: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    L = a.size
-    point = int(RNG.integers(1, L))
-    c1 = np.concatenate([a[:point], b[point:]]).astype(np.float32)
-    c2 = np.concatenate([b[:point], a[point:]]).astype(np.float32)
-    return c1, c2
-
-
-def crossover_per_chromosome(pa: List[np.ndarray], pb: List[np.ndarray]) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-    child1, child2 = [], []
-    for idx in range(3):
-        if RNG.random() < CROSSOVER_PROB:
-            ca, cb = one_point_crossover(pa[idx], pb[idx])
-        else:
-            ca, cb = pa[idx].copy(), pb[idx].copy()
-        child1.append(ca); child2.append(cb)
-    return child1, child2
-
-
-def symmetrize_pairs(vec: np.ndarray, p: float = SYMMETRIZE_P) -> np.ndarray:
-    L = vec.size
-    out = vec.copy()
-    if RNG.random() < p:
-        for i in range(L // 2):
-            j = L - 1 - i
-            m = 0.5 * (out[i] + out[j])
-            out[i] = m; out[j] = m
-    return out
-
-
-def symmetry_aware_mutation(vec: np.ndarray, mut_p: float, sigma: float) -> np.ndarray:
-    L = vec.size
-    out = vec.copy()
-    for i in range(L // 2):
-        if RNG.random() < mut_p:
-            j = L - 1 - i
-            eps = RNG.normal(0.0, sigma)
-            out[i] = np.clip(out[i] + eps, 0.0, 1.0)
-            out[j] = np.clip(out[j] + eps, 0.0, 1.0)
-    if L % 2 == 1 and RNG.random() < mut_p:
-        mid = L // 2
-        out[mid] = np.clip(out[mid] + RNG.normal(0.0, sigma), 0.0, 1.0)
-    return out.astype(np.float32)
-
-
-def gaussian_mutation(gen: List[np.ndarray]) -> List[np.ndarray]:
-    mutated = []
-    for chrom in gen:
-        # standard per-gene mutate mask, then enforce symmetry-aware coupling
-        to_mut = RNG.random(chrom.shape) < MUTATION_PROB
-        noise = RNG.normal(loc=0.0, scale=MUTATION_STD, size=chrom.shape).astype(np.float32)
-        new_chrom = np.clip(chrom + noise * to_mut, 0.0, 1.0)
-        new_chrom = symmetry_aware_mutation(new_chrom, mut_p=0.05, sigma=MUTATION_STD)
-        new_chrom = symmetrize_pairs(new_chrom)
-        mutated.append(new_chrom.astype(np.float32))
-    return mutated
-
-# =============== Decode & build ===============
-def decode_and_build(genotype: List[np.ndarray]):
-    nde = NeuralDevelopmentalEncoding(number_of_modules=NUM_MODULES)
-    p_type, p_conn, p_rot = nde.forward(genotype)
-    hpd = HighProbabilityDecoder(NUM_MODULES)
-    robot_graph = hpd.probability_matrices_to_graph(p_type, p_conn, p_rot)
-    core = construct_mjspec_from_graph(robot_graph)
-    return robot_graph, core
-
-# =============== Fitness ===============
-def fitness_function(history: list[Tuple[float, float, float]]) -> float:
-    """Negative Euclidean distance to TARGET_POSITION (maximization)."""
+# ========= Helpers =========
+def fitness_function(history: List[Tuple[float, float, float]]) -> float:
+    """Negative Euclidean distance to TARGET_POSITION."""
     if not history:
         return -1e6
     xc, yc, zc = history[-1]
     diff = TARGET_POSITION - np.array([xc, yc, zc], dtype=np.float64)
     return -float(np.linalg.norm(diff))
 
-# =============== Zero-control stability sanity ===============
-def zero_control_stability(model: mj.MjModel, data: mj.MjData, duration: float = 0.2) -> bool:
-    """Run a very short sim with zero control; return False if it NaNs/explodes."""
+def extract_end_xyz_or_fallback(model: mj.MjModel, data: mj.MjData) -> Tuple[float, float, float]:
+    """If tracker is empty, read 'core' body pos or fallback to first non-world body."""
+    try:
+        bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, "core")
+        pos = np.array(data.xpos[bid], dtype=np.float64)
+    except Exception:
+        bid = 1 if model.nbody > 1 else 0
+        pos = np.array(data.xpos[bid], dtype=np.float64)
+    if not np.isfinite(pos).all():
+        pos = np.nan_to_num(pos, nan=0.0, posinf=0.0, neginf=0.0)
+    return float(pos[0]), float(pos[1]), float(pos[2])
+
+def zero_control_stability(model: mj.MjModel, duration: float = ZERO_STAB_SEC) -> bool:
+    """Very cheap sanity check; returns False if the sim explodes (NaNs)."""
     mj.set_mjcb_control(None)
+    data = mj.MjData(model)
+    mj.mj_resetData(model, data)
     def cb(m: mj.MjModel, d: mj.MjData):
         if m.nu:
             d.ctrl[:] = 0.0
@@ -190,274 +134,364 @@ def zero_control_stability(model: mj.MjModel, data: mj.MjData, duration: float =
         simple_runner(model, data, duration=duration, steps_per_loop=40)
     except Exception:
         return False
-    if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
-        return False
-    return True
+    return np.isfinite(data.qpos).all() and np.isfinite(data.qvel).all()
 
-# =============== Inner RevDE (CPG) ===============
+# ---- Build helpers (pure pruning; no graph edits) ----
+def try_build_from_graph(robot_graph):
+    """Attempt to build MuJoCo spec from an existing graph; return (core, world, model) or None."""
+    sx, sy = float(SPAWN_POS[0]), float(SPAWN_POS[1])
+    # More generous spawn heights
+    candidate_z = [max(float(SPAWN_POS[2]), 0.20), 0.30, 0.40, 0.60, 0.80, 1.00, 1.20]
+    try:
+        mj.set_mjcb_control(None)
+    except Exception:
+        pass
+    try:
+        core = construct_mjspec_from_graph(robot_graph)
+    except Exception:
+        return None
+    for sz in candidate_z:
+        try:
+            world = OlympicArena()
+            # Allow the environment helper to correct the spawn for bounding boxes
+            world.spawn(core.spec, spawn_position=[sx, sy, float(sz)], correct_for_bounding_box=True)
+            model = world.spec.compile()
+            return core, world, model
+        except Exception:
+            continue
+    return None
 
-def make_controller_callback(model: mj.MjModel, phases: np.ndarray, A: float, freq_hz: float):
-    """Return a MuJoCo control callback implementing the CPG with given params."""
+def nde_decode_build(
+    genotype: List[np.ndarray],
+    nde: NeuralDevelopmentalEncoding,
+    hpd: HighProbabilityDecoder,
+):
+    """Deterministic (per-genotype) decode + build with an expanded, fixed resample ladder."""
+    # Stable seed from SHA-256 of the flat genotype bytes (NOT Python hash)
+    flat = np.concatenate([genotype[0].ravel(), genotype[1].ravel(), genotype[2].ravel()]).astype(np.float32)
+    digest = hashlib.sha256(flat.tobytes()).digest()
+    base_seed = int.from_bytes(digest[:4], "little")  # 32-bit
+
+    # Save RNG states so we don't affect global randomness
+    np_state = np.random.get_state()
+    py_state = random.getstate()
+
+    try:
+        with torch.no_grad():
+            p_type, p_conn, p_rot = nde.forward(genotype)
+
+        # Try more deterministic “neighbor” seeds to get a buildable sample (8 -> 64)
+        for offset in range(64):  # 0..63
+            seed = (base_seed + offset) & 0xFFFFFFFF
+            np.random.seed(seed)
+            random.seed(seed)
+
+            robot_graph = hpd.probability_matrices_to_graph(p_type, p_conn, p_rot)
+            built = try_build_from_graph(robot_graph)
+            if built is not None:
+                core, world, model = built
+                return robot_graph, core, world, model
+
+        # If none of the 64 decodes built, prune it
+        raise RuntimeError("Body not buildable from decoded graph (after 64 deterministic attempts)")
+
+    finally:
+        # Restore RNG state
+        np.random.set_state(np_state)
+        random.setstate(py_state)
+
+# ========= Enhanced CPG =========
+def make_cpg_callback(model: mj.MjModel, phases: np.ndarray, amps: np.ndarray, bias: np.ndarray, freq_hz: float):
+    """Per-joint sine CPG with per-joint amplitude and bias; global frequency."""
     nu = int(model.nu)
-    phases = phases.astype(np.float64)
-    A = float(np.clip(A, 0.0, CONTROL_BOUND))
-    FREQ_HZ = float(np.clip(freq_hz, 0.3, 1.0))
-    OMEGA = 2.0 * np.pi * FREQ_HZ
-
+    phases = np.asarray(phases, dtype=np.float64)
+    amps = np.asarray(amps, dtype=np.float64)
+    bias = np.asarray(bias, dtype=np.float64)
+    f = float(np.clip(freq_hz, 0.3, 2.0))
+    omega = 2.0 * np.pi * f
     def cb(m: mj.MjModel, d: mj.MjData):
         if d.time < QUIET_TIME:
             if m.nu:
                 d.ctrl[:] = 0.0
             return
         t = d.time - QUIET_TIME
-        # per-actuator sine with phase offsets
-        u = A * np.sin(OMEGA * t + phases)
+        u = amps * np.sin(omega * t + phases) + bias
         np.clip(u, -CONTROL_BOUND, CONTROL_BOUND, out=u)
         d.ctrl[:] = u
     return cb
 
+def clamp_theta_cpg2(nu: int, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """theta = [phases(nu), amps(nu), bias(nu), freq]."""
+    theta = np.asarray(theta, dtype=np.float64)
+    phases = np.mod(theta[:nu], 2.0 * np.pi)
+    amps = np.clip(theta[nu:2 * nu], 0.0, CONTROL_BOUND)
+    bias = np.clip(theta[2 * nu:3 * nu], -0.25 * np.pi, 0.25 * np.pi)
+    f = float(np.clip(theta[-1], 0.3, 2.0))
+    return phases, amps, bias, f
 
-def clamp_params(phases: np.ndarray, A: float, f: float) -> Tuple[np.ndarray, float, float]:
-    # wrap phases to [0, 2π)
-    phases = np.mod(phases, 2.0 * np.pi)
-    A = float(np.clip(A, 0.0, CONTROL_BOUND))
-    f = float(np.clip(f, 0.3, 1.0))
-    return phases, A, f
-
-
-def revde_optimize_cpg(spec, model: mj.MjModel,
-                       sim_seconds: float = REVDE_SIM) -> Tuple[float, Dict[str, Any]]:
-    """Small-pop RevDE optimizing phases (per-actuator) + global amplitude + frequency.
-    Returns (best_fitness, {phases, A, f}).
-    Note: Creates a fresh Tracker and MjData per candidate to avoid binding issues.
-    """
+# ========= Inner loop: CMA-ES on CPG (Nevergrad) =========
+def optimize_cpg_cma(spec, model: mj.MjModel, sim_seconds: float = INNER_SIM,
+                     budget_evals: int = CMA_BUDGET_EVALS) -> Tuple[float, Dict[str, Any]]:
+    """Train a CPG for THIS body using Nevergrad CMA; returns (best_fitness, ctrl_params)."""
     nu = int(model.nu)
     if nu == 0:
-        return -1e6, {"phases": np.zeros(0), "A": 0.0, "f": 0.7}
+        return -1e6, {"phases": np.zeros(0), "amps": np.zeros(0), "bias": np.zeros(0), "f": 0.8}
 
-    D = nu + 2  # phases per actuator + (A, f)
+    # [phases(nu)∈[0,2π), amps(nu)∈[0,π/2], bias(nu)∈[-π/4,π/4], freq∈[0.3,2.0]]
+    lower = np.concatenate([np.zeros(nu), np.zeros(nu), -0.25 * np.pi * np.ones(nu), [0.3]])
+    upper = np.concatenate([2.0 * np.pi * np.ones(nu), CONTROL_BOUND * np.ones(nu), 0.25 * np.pi * np.ones(nu), [2.0]])
+    init = np.concatenate([
+        RNG.uniform(0.0, 2.0 * np.pi, size=nu),
+        0.30 * CONTROL_BOUND * np.ones(nu),
+        RNG.uniform(-0.05 * np.pi, 0.05 * np.pi, size=nu),
+        [0.8],
+    ])
 
-    # Bounds / initialization
-    def init_individual():
-        phases0 = RNG.uniform(0.0, 2.0*np.pi, size=nu).astype(np.float64)
-        A0 = float(RNG.uniform(0.2, 0.8) * CONTROL_BOUND)
-        f0 = float(RNG.uniform(0.4, 0.9))
-        return np.concatenate([phases0, np.array([A0, f0])]).astype(np.float64)
+    instrumentation = ng.p.Array(init=init).set_bounds(lower, upper)
+    # Smaller sigma to avoid NG warning; roughly 1/6 of smallest range
+    instrumentation = instrumentation.set_mutation(sigma=0.25)
 
-    pop = np.stack([init_individual() for _ in range(REVDE_POP)], axis=0)
+    opt = ng.optimizers.CMA(parametrization=instrumentation, budget=budget_evals, num_workers=CMA_WORKERS)
 
-    def evaluate(vec: np.ndarray) -> float:
-        phases = vec[:nu].copy()
-        A, f = float(vec[-2]), float(vec[-1])
-        phases, A, f = clamp_params(phases, A, f)
-
-        # fresh data + tracker per evaluation
+    def evaluate_theta(th: np.ndarray) -> float:
+        phases, amps, bias, f = clamp_theta_cpg2(nu, th)
         data = mj.MjData(model)
         mj.mj_resetData(model, data)
-        local_tracker = Tracker(mj.mjtObj.mjOBJ_GEOM, "core")
-        local_tracker.setup(spec, data)
-
+        tracker = Tracker(mj.mjtObj.mjOBJ_GEOM, "core")
+        tracker.setup(spec, data)
         mj.set_mjcb_control(None)
-        cb = make_controller_callback(model, phases, A, f)
-        mj.set_mjcb_control(cb)
-
+        mj.set_mjcb_control(make_cpg_callback(model, phases, amps, bias, f))
         try:
             simple_runner(model, data, duration=sim_seconds, steps_per_loop=80)
         except Exception:
-            return -1e6
+            return 1e6  # NG minimizes
+        xpos = tracker.history.get("xpos", {}).get(0, [])
+        if not xpos:
+            xpos = [extract_end_xyz_or_fallback(model, data)]
+        return -fitness_function(xpos)  # loss
 
-        xpos = local_tracker.history.get("xpos", {}).get(0, [])
-        return fitness_function(xpos)
+    for _ in range(budget_evals):
+        cand = opt.ask()
+        loss = evaluate_theta(cand.value)
+        opt.tell(cand, loss)
 
-    fitness = np.array([evaluate(ind) for ind in pop], dtype=np.float64)
+    rec = opt.provide_recommendation()
+    phases, amps, bias, f = clamp_theta_cpg2(nu, rec.value)
 
-    for _ in range(REVDE_GENS):
-        best_idx = int(np.argmax(fitness))
-        best = pop[best_idx]
-        new_pop = pop.copy()
-        new_fit = fitness.copy()
-        for i in range(REVDE_POP):
-            # choose r1, r2 distinct from i
-            idxs = [j for j in range(REVDE_POP) if j != i]
-            r1, r2 = RNG.choice(idxs, size=2, replace=False)
-            vi = pop[i] + REVDE_F * (best - pop[i]) + REVDE_F * (pop[r1] - pop[r2])
-            # binomial crossover
-            cross_mask = RNG.random(D) < REVDE_CR
-            if not cross_mask.any():
-                cross_mask[RNG.integers(0, D)] = True
-            trial = np.where(cross_mask, vi, pop[i])
-            fit_trial = evaluate(trial)
-            if fit_trial > fitness[i]:
-                new_pop[i] = trial
-                new_fit[i] = fit_trial
-        pop, fitness = new_pop, new_fit
-
-    best_idx = int(np.argmax(fitness))
-    best_vec = pop[best_idx]
-    phases = best_vec[:nu].copy()
-    A, f = float(best_vec[-2]), float(best_vec[-1])
-    phases, A, f = clamp_params(phases, A, f)
-    return float(fitness[best_idx]), {"phases": phases, "A": A, "f": f}
-
-# =============== Evaluate a genotype (single objective) ===============
- #(single objective) ===============
-def evaluate_genotype(genotype: List[np.ndarray]) -> Tuple[float, list, Dict[str, Any]]:
-    key = hash_genotype(genotype)
-    if key in _eval_cache:
-        c = _eval_cache[key]
-        return c["fitness"], c.get("history", []), c.get("ctrl", {})
-
-    # Decode & compile
-    try:
-        robot_graph, core = decode_and_build(genotype)
-        world = OlympicArena()
-        world.spawn(core.spec, spawn_position=SPAWN_POS)
-        model = world.spec.compile()
-        data = mj.MjData(model)
-        mj.mj_resetData(model, data)
-    except Exception:
-        _eval_cache[key] = {"fitness": -1e6}
-        return -1e6, [], {}
-
-    # Actuator band gate
-    nu = int(model.nu)
-    if nu < NU_MIN or nu > NU_MAX:
-        _eval_cache[key] = {"fitness": -1e6}
-        return -1e6, [], {}
-
-    # Zero-control stability sanity (very cheap)
-    if not zero_control_stability(model, data, duration=0.2):
-        _eval_cache[key] = {"fitness": -1e6}
-        return -1e6, [], {}
-
-    # Inner RevDE to get controller params and best fitness (single score)
-    best_fit, ctrl_params = revde_optimize_cpg(world.spec, model, sim_seconds=REVDE_SIM)
-
-    # Optional: final short full-duration confirmation rollout for history (uses learned params)
-    phases = ctrl_params.get("phases", np.zeros(nu))
-    A = ctrl_params.get("A", 0.4 * CONTROL_BOUND)
-    f = ctrl_params.get("f", 0.7)
-    phases, A, f = clamp_params(phases, A, f)
-
+    # Re-eval best as positive fitness
+    data = mj.MjData(model)
+    mj.mj_resetData(model, data)
+    tracker = Tracker(mj.mjtObj.mjOBJ_GEOM, "core")
+    tracker.setup(spec, data)
     mj.set_mjcb_control(None)
-    data2 = mj.MjData(model)
-    mj.mj_resetData(model, data2)
-    tracker2 = Tracker(mj.mjtObj.mjOBJ_GEOM, "core")
-    tracker2.setup(world.spec, data2)
-    cb = make_controller_callback(model, phases, A, f)
-    mj.set_mjcb_control(cb)
+    mj.set_mjcb_control(make_cpg_callback(model, phases, amps, bias, f))
     try:
-        simple_runner(model, data2, duration=SIM_DURATION, steps_per_loop=80)
+        simple_runner(model, data, duration=sim_seconds, steps_per_loop=80)
+    except Exception:
+        return -1e6, {"phases": phases, "amps": amps, "bias": bias, "f": f}
+    xpos = tracker.history.get("xpos", {}).get(0, [])
+    if not xpos:
+        xpos = [extract_end_xyz_or_fallback(model, data)]
+    return fitness_function(xpos), {"phases": phases, "amps": amps, "bias": bias, "f": f}
+
+# ========= EvoTorch pieces: operators + Problem =========
+class GaussianMut(Operator):
+    """Per-gene Gaussian mutation with clipping to [0,1], in-place on a SolutionBatch."""
+    def __init__(self, problem, mut_p=MUT_P, sigma=MUT_SIGMA):
+        super().__init__(problem)
+        self.mut_p = float(mut_p)
+        self.sigma = float(sigma)
+
+    def _do(self, batch):  # mutate in place
+        vals = batch.access_values(keep_evals=False)  # shape: [n, L], torch.float32
+        n, L = vals.shape
+        assert L == CHROMOSOMES * GENE_LEN, f"Got genome len {L}, expected {CHROMOSOMES*GENE_LEN}"
+        x = vals.view(n, CHROMOSOMES, GENE_LEN)       # [n, 3, 64]
+        mask = (torch.rand_like(x) < self.mut_p)      # bool mask
+        noise = torch.randn_like(x) * self.sigma
+        x.add_(noise * mask)                          # in-place add
+        x.clamp_(0.0, 1.0)                            # in-place clip
+
+class UniformCrossover(Operator):
+    """Pairwise uniform crossover over flat genome [0,1]."""
+    def __init__(self, problem, rate: float = 0.5):
+        super().__init__(problem)
+        self.rate = float(rate)
+
+    def _do(self, batch: SolutionBatch):
+        vals = batch.access_values(keep_evals=False)   # [n, L]
+        n, L = vals.shape
+        if n < 2:
+            return
+        mates = vals[torch.randperm(n)]
+        mask = (torch.rand(n, L, device=vals.device) < self.rate)
+        vals.copy_(torch.where(mask, mates, vals))
+
+def _hash_genotype(arr3x64: np.ndarray) -> bytes:
+    return arr3x64.astype(np.float32).tobytes()
+
+class BodyProblem(Problem):
+    """Outer-loop fitness = best learned controller fitness per body (single objective)."""
+    def __init__(self):
+        super().__init__(
+            solution_length=CHROMOSOMES * GENE_LEN,
+            bounds=BOUNDS,
+            objective_sense="max",
+        )
+        # Persistent decoder stack: one NDE/HPD per run
+        torch.manual_seed(SEED)
+        np.random.seed(SEED)
+        self.nde = NeuralDevelopmentalEncoding(number_of_modules=NUM_OF_MODULES)
+        self.nde.eval()
+        for p in self.nde.parameters():
+            p.requires_grad_(False)
+        self.hpd = HighProbabilityDecoder(NUM_OF_MODULES)
+
+        self.cache: Dict[bytes, Dict[str, Any]] = {}
+        # Telemetry
+        self.stats = {"evals": 0, "built": 0, "bad_nu": 0, "unstable": 0}
+
+    def _eval_one(self, solution: Solution):
+        self.stats["evals"] += 1
+
+        arr = solution.values.detach().cpu().numpy().astype(np.float32)
+        arr = arr.reshape(CHROMOSOMES, GENE_LEN)  # (3, 64)
+
+        key = _hash_genotype(arr)
+        if key in self.cache:
+            rec = self.cache[key]
+            solution.set_evaluation(rec["fitness"])
+            return
+
+        genotype = [arr[0], arr[1], arr[2]]
+
+        # Decode & build with persistent NDE/HPD (pure pruning + deterministic resampling)
+        try:
+            robot_graph, core, world, model = nde_decode_build(genotype, self.nde, self.hpd)
+            self.stats["built"] += 1
+        except Exception:
+            solution.set_evaluation(-1e6)
+            return
+
+        nu = int(model.nu)
+        if not (NU_MIN <= nu <= NU_MAX):
+            self.stats["bad_nu"] += 1
+            solution.set_evaluation(-1e6); return
+        if not zero_control_stability(model, ZERO_STAB_SEC):
+            self.stats["unstable"] += 1
+            solution.set_evaluation(-1e6); return
+
+        # Inner loop: Nevergrad CMA to train a CPG
+        best_fit, ctrl = optimize_cpg_cma(world.spec, model, sim_seconds=INNER_SIM, budget_evals=CMA_BUDGET_EVALS)
+
+        self.cache[key] = {"fitness": best_fit, "nu": nu, "ctrl": ctrl, "graph": copy.deepcopy(robot_graph)}
+        solution.set_evaluation(best_fit)
+
+    def evaluate(self, solutions):
+        if isinstance(solutions, SolutionBatch):
+            for i in range(len(solutions)):
+                self._eval_one(solutions[i])
+        elif isinstance(solutions, Solution):
+            self._eval_one(solutions)
+        else:
+            for sol in solutions:
+                self._eval_one(sol)
+
+class GAWithImmigrants(GeneticAlgorithm):
+    """Standard GA step + inject K random immigrants each generation."""
+    def __init__(self, problem, *, immigrants_frac: float = 0.10, **kwargs):
+        super().__init__(problem, **kwargs)
+        self._imm_frac = float(immigrants_frac)
+
+    def _step(self):
+        # 1) Do the standard GA step (reproduction + elitist selection)
+        super()._step()
+
+        # 2) Add immigrants and reselect
+        pop = self._population                      # SolutionBatch
+        P = len(pop)
+        K = max(1, int(P * self._imm_frac))
+
+        # Fresh random solutions
+        rnd = self._problem.generate_batch(K)
+        self._problem.evaluate(rnd)                 # make sure they have evals
+
+        # Concatenate and keep the best P individuals
+        extended = SolutionBatch.cat([pop, rnd])    # new SolutionBatch
+        self._population = extended.take_best(P)    # respects objective_sense
+
+# ========= Run: GA → save best JSON + video =========
+def run():
+    try:
+        mj.set_mjcb_control(None)
     except Exception:
         pass
 
-    hist = tracker2.history.get("xpos", {}).get(0, [])
-    fit_final = fitness_function(hist) if hist else best_fit
+    problem = BodyProblem()
 
-    rec = {
-        "fitness": fit_final,
-        "history": hist,
-        "ctrl": ctrl_params,
-        "robot_graph": robot_graph,
-        "core": core,
-    }
-    _eval_cache[key] = rec
-    return fit_final, hist, ctrl_params
-
-# =============== EA main loop ===============
-def run_ea():
-    mj.set_mjcb_control(None)
-    population = [biased_random_genotype() for _ in range(POP_SIZE)]
-
-    fitnesses: List[float] = []
-    histories: List[list] = []
-    ctrls: List[Dict[str, Any]] = []
-
-    for i, gen in enumerate(population):
-        fit, his, ctrl = evaluate_genotype(gen)
-        fitnesses.append(fit); histories.append(his); ctrls.append(ctrl)
-
-    for gen_idx in range(GENS):
-        print(f"=== Generation {gen_idx+1} ===")
-
-        # roulette-wheel selection probabilities
-        f_arr = np.array(fitnesses, dtype=np.float64)
-        weights = f_arr - f_arr.min() + 1e-9
-        probs = weights / max(weights.sum(), 1e-9)
-
-        # produce children
-        children: List[List[np.ndarray]] = []
-        while len(children) < POP_SIZE:
-            pa, pb = RNG.choice(len(population), size=2, replace=False, p=probs)
-            c1, c2 = crossover_per_chromosome(population[pa], population[pb])
-            children.append(gaussian_mutation(c1))
-            if len(children) < POP_SIZE:
-                children.append(gaussian_mutation(c2))
-
-        # evaluate children
-        child_fits: List[float] = []
-        child_hists: List[list] = []
-        child_ctrls: List[Dict[str, Any]] = []
-        for chi in children:
-            fit, his, ctrl = evaluate_genotype(chi)
-            child_fits.append(fit); child_hists.append(his); child_ctrls.append(ctrl)
-
-        # elitist survivor selection (mu+lambda) → keep best POP_SIZE
-        combined = population + children
-        combined_fit = fitnesses + child_fits
-        combined_hist = histories + child_hists
-        combined_ctrl = ctrls + child_ctrls
-        order = np.argsort(combined_fit)[::-1][:POP_SIZE]
-        population = [combined[i] for i in order]
-        fitnesses = [combined_fit[i] for i in order]
-        histories = [combined_hist[i] for i in order]
-        ctrls = [combined_ctrl[i] for i in order]
-
-        print("Survivors (top -> bottom):")
-        for r, f in enumerate(fitnesses):
-            print(f"{r+1}: {f:.4f}")
-
-    # Best individual
-    best_idx = int(np.argmax(fitnesses))
-    best_gen, best_hist, best_fit, best_ctrl = (
-        population[best_idx], histories[best_idx], fitnesses[best_idx], ctrls[best_idx]
+    ga_kwargs = dict(
+        popsize=POP_SIZE,
+        operators=[UniformCrossover(problem, rate=0.5), GaussianMut(problem)],
+        elitist=True,
     )
-    print("=== EA finished ===")
-    print(f"Best fitness: {best_fit:.4f}")
 
-    # Save best robot JSON
-    robot_graph, core = decode_and_build(best_gen)
-    out_json = OUTPUT / "best_robot.json"
+    sig = inspect.signature(GeneticAlgorithm)
+    if "tournament_size" in sig.parameters:
+        ga_kwargs["tournament_size"] = TOURNAMENT_K
+    if "crossover_rate" in sig.parameters:
+        ga_kwargs["crossover_rate"] = 1.0  # we also apply an explicit crossover operator
+
+    ga = GAWithImmigrants(problem, immigrants_frac=0.10, **ga_kwargs)
+
+    ga.run(num_generations=NGENS)
+
+    # Telemetry
+    print("Evals: {evals} | built: {built} | bad_nu: {bad_nu} | unstable: {unstable}".format(**problem.stats))
+
+    best: Solution = ga.status["pop_best"]
+    best_arr = best.values.detach().cpu().numpy().astype(np.float32).reshape(CHROMOSOMES, GENE_LEN)
+    best_gen = [best_arr[0], best_arr[1], best_arr[2]]
+
+    # Prefer the cached graph that actually built during evolution
+    key = _hash_genotype(np.asarray(best_arr, dtype=np.float32))
+    cached = problem.cache.get(key)
+
+    if cached is not None:
+        robot_graph = cached["graph"]
+        built = try_build_from_graph(robot_graph)
+        if built is None:
+            # Fallback to re-decode (deterministic with persistent NDE/HPD + resample ladder)
+            robot_graph, core, world, model = nde_decode_build(best_gen, problem.nde, problem.hpd)
+        else:
+            core, world, model = built
+    else:
+        robot_graph, core, world, model = nde_decode_build(best_gen, problem.nde, problem.hpd)
+
+    out_json = OUT / "robot_graph.json"
     save_graph_as_json(robot_graph, out_json)
     print(f"Saved best robot graph to {out_json}")
 
-    # Save best video with learned controller
+    # Train controller again for video (or fetch from cache if you prefer)
+    best_fit, ctrl = optimize_cpg_cma(world.spec, model, sim_seconds=INNER_SIM, budget_evals=CMA_BUDGET_EVALS)
+    print(f"Best fitness (re-eval): {best_fit:.4f}")
+
+    # Final video over SIM_DURATION with learned controller
     mj.set_mjcb_control(None)
-    world = OlympicArena()
-    world.spawn(core.spec, spawn_position=SPAWN_POS)
-    model = world.spec.compile()
     data = mj.MjData(model)
     mj.mj_resetData(model, data)
-
     tracker = Tracker(mj.mjtObj.mjOBJ_GEOM, "core")
     tracker.setup(world.spec, data)
 
     nu = int(model.nu)
-    phases = np.zeros(nu) if not best_ctrl else best_ctrl.get("phases", np.zeros(nu))
-    A = CONTROL_BOUND * 0.4 if not best_ctrl else best_ctrl.get("A", CONTROL_BOUND*0.4)
-    f = 0.7 if not best_ctrl else best_ctrl.get("f", 0.7)
-    phases, A, f = clamp_params(phases, A, f)
+    phases = ctrl.get("phases", np.zeros(nu))
+    amps = ctrl.get("amps", 0.30 * CONTROL_BOUND * np.ones(nu))
+    bias = ctrl.get("bias", np.zeros(nu))
+    f = ctrl.get("f", 0.8)
 
-    cb = make_controller_callback(model, phases, A, f)
-    mj.set_mjcb_control(cb)
-
-    video_folder = OUTPUT / "videos"
-    recorder = VideoRecorder(output_folder=str(video_folder))
+    mj.set_mjcb_control(make_cpg_callback(model, phases, amps, bias, f))
+    recorder = VideoRecorder(output_folder=str(OUT / "videos"))
     video_renderer(model, data, duration=SIM_DURATION, video_recorder=recorder)
-    print(f"Saved video of best robot to {video_folder}")
-
-    return best_gen, best_hist, best_fit
-
+    print(f"Saved video to {OUT/'videos'}")
 
 if __name__ == "__main__":
-    run_ea()
+    run()
