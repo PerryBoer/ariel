@@ -1,0 +1,294 @@
+{
+    "directed": true,
+    "multigraph": false,
+    "graph": {},
+    "nodes": [
+        {
+            "type": "NONE",
+            "rotation": "DEG_0",
+            "id": 3
+        },
+        {
+            "type": "CORE",
+            "rotation": "DEG_0",
+            "id": 0
+        },
+        {
+            "type": "HINGE",
+            "rotation": "DEG_270",
+            "id": 14
+        },
+        {
+            "type": "HINGE",
+            "rotation": "DEG_270",
+            "id": 2
+        },
+        {
+            "type": "HINGE",
+            "rotation": "DEG_270",
+            "id": 16
+        },
+        {
+            "type": "BRICK",
+            "rotation": "DEG_135",
+            "id": 8
+        },
+        {
+            "type": "HINGE",
+            "rotation": "DEG_45",
+            "id": 6
+        },
+        {
+            "type": "BRICK",
+            "rotation": "DEG_0",
+            "id": 19
+        },
+        {
+            "type": "NONE",
+            "rotation": "DEG_0",
+            "id": 28
+        },
+        {
+            "type": "HINGE",
+            "rotation": "DEG_180",
+            "id": 26
+        },
+        {
+            "type": "BRICK",
+            "rotation": "DEG_90",
+            "id": 25
+        },
+        {
+            "type": "HINGE",
+            "rotation": "DEG_90",
+            "id": 27
+        },
+        {
+            "type": "BRICK",
+            "rotation": "DEG_180",
+            "id": 29
+        },
+        {
+            "type": "NONE",
+            "rotation": "DEG_0",
+            "id": 24
+        },
+        {
+            "type": "NONE",
+            "rotation": "DEG_0",
+            "id": 18
+        },
+        {
+            "type": "NONE",
+            "rotation": "DEG_0",
+            "id": 11
+        },
+        {
+            "type": "BRICK",
+            "rotation": "DEG_270",
+            "id": 4
+        },
+        {
+            "type": "BRICK",
+            "rotation": "DEG_90",
+            "id": 20
+        },
+        {
+            "type": "BRICK",
+            "rotation": "DEG_180",
+            "id": 12
+        },
+        {
+            "type": "HINGE",
+            "rotation": "DEG_0",
+            "id": 15
+        },
+        {
+            "type": "HINGE",
+            "rotation": "DEG_0",
+            "id": 23
+        },
+        {
+            "type": "HINGE",
+            "rotation": "DEG_225",
+            "id": 10
+        },
+        {
+            "type": "HINGE",
+            "rotation": "DEG_90",
+            "id": 5
+        },
+        {
+            "type": "BRICK",
+            "rotation": "DEG_315",
+            "id": 1
+        },
+        {
+            "type": "NONE",
+            "rotation": "DEG_0",
+            "id": 21
+        },
+        {
+            "type": "HINGE",
+            "rotation": "DEG_90",
+            "id": 13
+        },
+        {
+            "type": "NONE",
+            "rotation": "DEG_0",
+            "id": 9
+        },
+        {
+            "type": "NONE",
+            "rotation": "DEG_0",
+            "id": 22
+        },
+        {
+            "type": "HINGE",
+            "rotation": "DEG_315",
+            "id": 17
+        }
+    ],
+    "edges": [
+        {
+            "face": "FRONT",
+            "source": 0,
+            "target": 14
+        },
+        {
+            "face": "BACK",
+            "source": 0,
+            "target": 2
+        },
+        {
+            "face": "LEFT",
+            "source": 0,
+            "target": 16
+        },
+        {
+            "face": "TOP",
+            "source": 0,
+            "target": 3
+        },
+        {
+            "face": "FRONT",
+            "source": 14,
+            "target": 8
+        },
+        {
+            "face": "FRONT",
+            "source": 2,
+            "target": 27
+        },
+        {
+            "face": "FRONT",
+            "source": 8,
+            "target": 28
+        },
+        {
+            "face": "LEFT",
+            "source": 8,
+            "target": 19
+        },
+        {
+            "face": "TOP",
+            "source": 8,
+            "target": 25
+        },
+        {
+            "face": "BOTTOM",
+            "source": 8,
+            "target": 6
+        },
+        {
+            "face": "FRONT",
+            "source": 19,
+            "target": 4
+        },
+        {
+            "face": "RIGHT",
+            "source": 19,
+            "target": 20
+        },
+        {
+            "face": "TOP",
+            "source": 19,
+            "target": 5
+        },
+        {
+            "face": "BOTTOM",
+            "source": 19,
+            "target": 12
+        },
+        {
+            "face": "FRONT",
+            "source": 25,
+            "target": 24
+        },
+        {
+            "face": "LEFT",
+            "source": 25,
+            "target": 18
+        },
+        {
+            "face": "RIGHT",
+            "source": 25,
+            "target": 11
+        },
+        {
+            "face": "TOP",
+            "source": 25,
+            "target": 29
+        },
+        {
+            "face": "TOP",
+            "source": 29,
+            "target": 26
+        },
+        {
+            "face": "LEFT",
+            "source": 4,
+            "target": 15
+        },
+        {
+            "face": "RIGHT",
+            "source": 4,
+            "target": 23
+        },
+        {
+            "face": "TOP",
+            "source": 20,
+            "target": 1
+        },
+        {
+            "face": "FRONT",
+            "source": 12,
+            "target": 9
+        },
+        {
+            "face": "FRONT",
+            "source": 15,
+            "target": 10
+        },
+        {
+            "face": "FRONT",
+            "source": 23,
+            "target": 17
+        },
+        {
+            "face": "FRONT",
+            "source": 1,
+            "target": 21
+        },
+        {
+            "face": "RIGHT",
+            "source": 1,
+            "target": 13
+        },
+        {
+            "face": "FRONT",
+            "source": 13,
+            "target": 22
+        }
+    ]
+}

@@ -1,0 +1,30 @@
+{
+  "best_overall_fitness": -5.5198346579499615,
+  "inner_revde": {
+    "pop": 5,
+    "gens": 5,
+    "alpha": 0.12,
+    "bounds": {
+      "phase": [
+        -3.141592653589793,
+        3.141592653589793
+      ],
+      "A": [
+        0.0,
+        0.8
+      ],
+      "F": [
+        0.4,
+        2.0
+      ]
+    },
+    "revde_f": -0.5,
+    "crossover_rate": 0.9
+  },
+  "outer_ga": {
+    "pop": 5,
+    "gens": 5,
+    "genotype_size": 64,
+    "num_modules": 30
+  }
+}

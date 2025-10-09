@@ -1,22 +1,24 @@
-"""
-Evolutionary algorithm to evolve the robot body. Performs:
-- roulette wheel parent selection
-- one-point crossover per genotype vector
-- gaussian mutation per genotype vector
-And saves best robot json and video after final generation
-"""
+"""Assignment 3 template code."""
 
+# Standard library
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, List, Tuple
+from typing import TYPE_CHECKING, Any, Literal
 
+import math
 import matplotlib.pyplot as plt
 import mujoco as mj
 import numpy as np
 import numpy.typing as npt
+import torch
 from mujoco import viewer
-import torch  # <-- added
 
-### Local libraries
+# EvoTorch
+from evotorch import Problem
+from evotorch.algorithms import CMAES
+from evotorch.core import SolutionBatch
+from evotorch.logging import StdOutLogger
+
+# Local libraries
 from ariel import console
 from ariel.body_phenotypes.robogen_lite.constructor import (
     construct_mjspec_from_graph,
@@ -33,251 +35,425 @@ from ariel.utils.runners import simple_runner
 from ariel.utils.tracker import Tracker
 from ariel.utils.video_recorder import VideoRecorder
 
+# Type Checking
+if TYPE_CHECKING:
+    from networkx import DiGraph
+
+# Type Aliases
+type ViewerTypes = Literal["launcher", "video", "simple", "no_control", "frame"]
+
+# --- RANDOM GENERATOR SETUP --- #
 SEED = 42
 RNG = np.random.default_rng(SEED)
-np.random.seed(SEED)        # <-- added (HPD may use numpy's global RNG)
-torch.manual_seed(SEED)     # <-- added (NDE is a torch module)
+torch.manual_seed(SEED)
 
-### EA parameters
-POP_SIZE = 10
-GENS = 5
-GENE_LEN = 64
-SIM_DURATION = 10.0
-MUTATION_STD = 0.1
-MUTATION_PROB = 0.1
-CROSSOVER_PROB = 0.8
+# --- DATA SETUP ---
+SCRIPT_NAME = __file__.split("/")[-1][:-3]
+CWD = Path.cwd()
+DATA = CWD / "__data__" / SCRIPT_NAME
+DATA.mkdir(exist_ok=True)
+
+# Global variables
 SPAWN_POS = [-0.8, 0, 0.1]
-NUM_MODULES = 30
+NUM_OF_MODULES = 30
 TARGET_POSITION = [5, 0, 0.5]
 
-# data directory
-CWD = Path.cwd()
-OUTPUT = CWD / "__output__"
-OUTPUT.mkdir(parents=True, exist_ok=True)
 
-# --- instantiate NDE/HPD ONCE per run (minimal change) ---
-NDE = NeuralDevelopmentalEncoding(number_of_modules=NUM_MODULES)
-NDE.eval()
-for p in NDE.parameters():
-    p.requires_grad_(False)
-HPD = HighProbabilityDecoder(NUM_MODULES)
-# ----------------------------------------------------------
-
-def nn_controller(
-    model: mj.MjModel,
-    data: mj.MjData,
-) -> npt.NDArray[np.float64]:
-    """
-    Minimal fixed-parameter CPG (global sine) controller.
-    - No evolvable controller params (constants only).
-    - Deterministic phase offsets per actuator index.
-    - Actions clipped to [-pi/2, pi/2] per assignment.
-    """
-    nu: int = model.nu
-    t: float = float(data.time)
-
-    # ---- Fixed CPG constants (NOT evolved) ----
-    CONTROL_BOUND = np.pi / 2              # required action bound
-    A = 0.6 * CONTROL_BOUND                # amplitude (conservative to avoid saturation)
-    FREQ_HZ = 0.7                          # gait frequency in Hz
-    OMEGA = 2.0 * np.pi * FREQ_HZ          # rad/s
-    BIAS = 0.0                             # center offset
-
-    if nu == 0:
-        return np.zeros(0, dtype=np.float64)
-
-    # Evenly spaced phase offsets over actuators (deterministic)
-    phases = 2.0 * np.pi * (np.arange(nu, dtype=np.float64) / nu)
-
-    # CPG signal per actuator
-    u = A * np.sin(OMEGA * t + phases) + BIAS
-
-    # Enforce assignment-mandated bounds
-    np.clip(u, -CONTROL_BOUND, CONTROL_BOUND, out=u)
-    return u
-
-### genotype functions
-def random_genotype() -> List[np.ndarray]:
-    """Initialize random genotype vectors"""
-    return [
-        RNG.random(GENE_LEN).astype(np.float32),
-        RNG.random(GENE_LEN).astype(np.float32),
-        RNG.random(GENE_LEN).astype(np.float32),
-    ]
-
-def one_point_crossover(a: np.ndarray, b: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Perform one-point crossover between two genotype vectors (of the same type)"""
-    L = a.size
-    point = int(RNG.integers(1, L))
-    c1 = np.concatenate([a[:point], b[point:]])
-    c2 = np.concatenate([b[:point], a[point:]])
-    return c1.astype(np.float32), c2.astype(np.float32)
-
-def crossover_per_chromosome(pa: List[np.ndarray], pb: List[np.ndarray]) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-    """From two parents, perform one-point crossover for each of the three vector types"""
-    child1, child2 = [], []
-    for idx in range(3):
-        if RNG.random() < CROSSOVER_PROB:
-            ca, cb = one_point_crossover(pa[idx], pb[idx])
-            child1.append(ca)
-            child2.append(cb)
-        else:
-            child1.append(pa[idx].copy())
-            child2.append(pb[idx].copy())
-    return child1, child2
-
-
-def gaussian_mutation(gen: List[np.ndarray]) -> List[np.ndarray]:
-    """Perform gaussian mutation on a genotype"""
-    mutated = []
-    for chrom in gen:
-        to_mut = RNG.random(chrom.shape) < MUTATION_PROB #determine which genes get mutated
-        noise = RNG.normal(loc=0.0, scale=MUTATION_STD, size=chrom.shape).astype(np.float32) #generate gaussian noise for each gene
-        new_chrom = np.clip(chrom + noise * to_mut, 0.0, 1.0) #apply noise only when gene is mutated
-        mutated.append(new_chrom.astype(np.float32))
-    return mutated
-
-
-### fitness evaluation
 def fitness_function(history: list[float]) -> float:
-    """From template: calculate fitness as negative cartesian distance (--> maximization problem)"""
     xt, yt, zt = TARGET_POSITION
     xc, yc, zc = history[-1]
+
+    # Minimize the distance --> maximize the negative distance
     cartesian_distance = np.sqrt(
         (xt - xc) ** 2 + (yt - yc) ** 2 + (zt - zc) ** 2,
     )
     return -cartesian_distance
 
-def decode_and_build(genotype: List[np.ndarray]):
-    """Decode NDE from a genotype and build robot (uses global NDE/HPD once per run).
-       Returns (robot_graph, core) or None if unbuildable."""
-    p_type, p_conn, p_rot = NDE.forward(genotype)
-    robot_graph = HPD.probability_matrices_to_graph(p_type, p_conn, p_rot)
+
+def show_xpos_history(history: list[float]) -> None:
+    # Create a tracking camera
+    camera = mj.MjvCamera()
+    camera.type = mj.mjtCamera.mjCAMERA_FREE
+    camera.lookat = [2.5, 0, 0]
+    camera.distance = 10
+    camera.azimuth = 0
+    camera.elevation = -90
+
+    # Initialize world to get the background
+    mj.set_mjcb_control(None)
+    world = OlympicArena()
+    model = world.spec.compile()
+    data = mj.MjData(model)
+    save_path = str(DATA / "background.png")
+    single_frame_renderer(
+        model,
+        data,
+        camera=camera,
+        save_path=save_path,
+        save=True,
+    )
+
+    # Setup background image
+    img = plt.imread(save_path)
+    _, ax = plt.subplots()
+    ax.imshow(img)
+    w, h, _ = img.shape
+
+    # Convert list of [x,y,z] positions to numpy array
+    pos_data = np.array(history)
+
+    # Calculate initial position
+    x0, y0 = int(h * 0.483), int(w * 0.815)
+    xc, yc = int(h * 0.483), int(w * 0.9205)
+    ym0, ymc = 0, SPAWN_POS[0]
+
+    # Convert position data to pixel coordinates
+    pixel_to_dist = -((ymc - ym0) / (yc - y0))
+    pos_data_pixel = [[xc, yc]]
+    for i in range(len(pos_data) - 1):
+        xi, yi, _ = pos_data[i]
+        xj, yj, _ = pos_data[i + 1]
+        xd, yd = (xj - xi) / pixel_to_dist, (yj - yi) / pixel_to_dist
+        xn, yn = pos_data_pixel[i]
+        pos_data_pixel.append([xn + int(xd), yn + int(yd)])
+    pos_data_pixel = np.array(pos_data_pixel)
+
+    # Plot x,y trajectory
+    ax.plot(x0, y0, "kx", label="[0, 0, 0]")
+    ax.plot(xc, yc, "go", label="Start")
+    ax.plot(pos_data_pixel[:, 0], pos_data_pixel[:, 1], "b-", label="Path")
+    ax.plot(pos_data_pixel[-1, 0], pos_data_pixel[-1, 1], "ro", label="End")
+
+    ax.set_xlabel("X Position")
+    ax.set_ylabel("Y Position")
+    ax.legend()
+    plt.title("Robot Path in XY Plane")
+    plt.show()
+
+
+# =========================
+# CPG + CMA-ES ADDITIONS
+# =========================
+
+# Bounds & smoothing
+PHASE_MIN, PHASE_MAX = -math.pi, math.pi
+AMP_MIN, AMP_MAX = 0.0, 0.8
+FREQ_MIN, FREQ_MAX = 0.4, 1.4
+ALPHA = 0.08  # gentler smoothing for stability
+
+
+def make_cpg_controller_from_params(
+    params: np.ndarray,
+    model: mj.MjModel,
+) -> callable:
+    """
+    params = [phase_0..phase_{nu-1}, AMP, FREQ]
+    Produces a MuJoCo control callback: (model, data) -> np.ndarray
+    """
+    nu = int(model.nu)
+    if nu == 0:
+        def empty_cb(m, d):
+            return np.zeros(0, dtype=np.float64)
+        return empty_cb
+
+    phases = np.asarray(params[:nu], dtype=np.float64)
+    AMP = float(params[nu])
+    FREQ = float(params[nu + 1])
+
+    # Safety clipping
+    phases = np.clip(phases, PHASE_MIN, PHASE_MAX)
+    AMP = float(np.clip(AMP, AMP_MIN, AMP_MAX))
+    FREQ = float(np.clip(FREQ, FREQ_MIN, FREQ_MAX))  # correct bounds
+
+    lo = model.actuator_ctrlrange[:, 0] if nu > 0 else np.array([])
+    hi = model.actuator_ctrlrange[:, 1] if nu > 0 else np.array([])
+    center = 0.5 * (hi + lo) if nu > 0 else np.array([])
+    half_span = 0.5 * (hi - lo) if nu > 0 else np.array([])
+
+    def cb(m: mj.MjModel, d: mj.MjData) -> npt.NDArray[np.float64]:
+        if m.nu == 0:
+            return np.zeros(0, dtype=np.float64)
+        t = d.time
+        y = AMP * np.sin(2.0 * math.pi * FREQ * t + phases)  # [-AMP, AMP]
+        y = np.clip(y, -1.0, 1.0)
+        target = center + half_span * y
+        np.clip(target, lo, hi, out=target)  # be safe in range
+        if d.ctrl is not None and len(d.ctrl) == m.nu:
+            d.ctrl[:] = d.ctrl + ALPHA * (target - d.ctrl)
+            return d.ctrl
+        else:
+            return target.astype(np.float64)
+
+    return cb
+
+
+def rollout_fitness_with_params(
+    robot_core: Any,
+    params: np.ndarray,
+    seconds: float = 1.5,  # short & cheap for CMA ranking
+) -> float:
+    """
+    Headless inner evaluation used by CMA-ES.
+    Reuses the same env (OlympicArena), spawn pos, tracker binding, and fitness_function.
+    """
+    mj.set_mjcb_control(None)
+    world = OlympicArena()
+
+    # Disable bbox correction to avoid compiling child spec directly
+    world.spawn(robot_core.spec, spawn_position=SPAWN_POS, correct_for_bounding_box=False)
+
+    model = world.spec.compile()
+    data = mj.MjData(model)
+    mj.mj_resetData(model, data)
+    if data.ctrl is not None:
+        data.ctrl[:] = 0.0
+
+    tracker = Tracker(mj.mjtObj.mjOBJ_GEOM, "core")
+    tracker.setup(world.spec, data)
+
+    controller_cb = make_cpg_controller_from_params(params, model)
+    ctrl = Controller(controller_callback_function=controller_cb, tracker=tracker)
+
     try:
-        core = construct_mjspec_from_graph(robot_graph)
-    except Exception:
-        # unbuildable body (e.g., invalid face for that module) → signal failure
-        return None
-    return robot_graph, core
+        mj.set_mjcb_control(lambda m, d: ctrl.set_control(m, d))
+        simple_runner(model, data, duration=seconds)
+
+        hist_list = tracker.history.get("xpos", [])
+        if not hist_list or len(hist_list[0]) == 0:
+            return -1e8  # empty trace → finite but poor
+
+        fit = float(fitness_function(hist_list[0]))
+        return fit if np.isfinite(fit) else -1e8
+
+    except Exception as e:
+        console.log(f"[red]Rollout failed: {e}[/red]")
+        return -1e9
+    finally:
+        mj.set_mjcb_control(None)
 
 
-def evaluate_genotype(genotype: List[np.ndarray]) -> Tuple[float, list]:
-    """Run headless simulation (for now with nn_controller) and calculate fitness"""
-    built = decode_and_build(genotype)
-    if built is None:
-        return -1e6, []  # prune unbuildable bodies
+class CPGProblem(Problem):
+    """
+    EvoTorch Problem: maximize the template's fitness_function using
+    CPG params theta = [phases (nu), A, F] for a fixed compiled body (robot_core).
+    """
+    def __init__(self, robot_core: Any):
+        model = robot_core.spec.compile()  # compile once to read nu
+        nu = int(model.nu)
+        L = nu + 2  # phases + A + F
 
-    robot_graph, core = built
+        lo = np.concatenate(
+            [np.full(nu, PHASE_MIN), [AMP_MIN], [FREQ_MIN]]
+        ).astype(np.float64)
+        hi = np.concatenate(
+            [np.full(nu, PHASE_MAX), [AMP_MAX], [FREQ_MAX]]
+        ).astype(np.float64)
 
-    mj.set_mjcb_control(None)
+        self._robot_core = robot_core
+
+        super().__init__(
+            objective_sense="max",
+            solution_length=L,
+            dtype=torch.float64,
+            device="cpu",
+            initial_bounds=(torch.from_numpy(lo), torch.from_numpy(hi)),
+        )
+
+    def evaluate(self, X):
+        if isinstance(X, SolutionBatch):
+            vals = X.access_values()
+            fits = []
+            for row in vals:
+                theta = row.detach().cpu().numpy()
+                f = rollout_fitness_with_params(self._robot_core, theta, seconds=1.5)
+                if not np.isfinite(f):
+                    f = -1e9
+                fits.append(f)
+            fits_t = torch.as_tensor(fits, dtype=vals.dtype, device=vals.device)
+            X.set_evals(fits_t)
+            return fits_t
+        elif isinstance(X, torch.Tensor):
+            fits = []
+            for row in X:
+                f = rollout_fitness_with_params(self._robot_core, row.detach().cpu().numpy(), seconds=1.5)
+                fits.append(f if np.isfinite(f) else -1e9)
+            return torch.as_tensor(fits, dtype=X.dtype, device=X.device)
+        else:
+            raise TypeError(f"Unsupported input to evaluate(): {type(X)}")
+
+
+def optimize_cpg_for_core(
+    robot_core: Any,
+    popsize: int = 8,     # small, fast proof-of-life; bump later (24)
+    gens: int = 4,        # small, fast proof-of-life; bump later (12)
+    sigma_init: float = 0.25,
+) -> np.ndarray:
+    model = robot_core.spec.compile()
+    nu = int(model.nu)
+    center = np.concatenate([np.zeros(nu), [0.3], [0.9]]).astype(np.float64)
+
+    prob = CPGProblem(robot_core)
+    solver = CMAES(
+        prob,
+        popsize=popsize,
+        stdev_init=sigma_init,
+        center_init=torch.from_numpy(center),
+    )
+    _ = StdOutLogger(solver, interval=1)  # EvoTorch logger
+
+    best_theta = center.copy()
+    best_fit = -1e12
+
+    for g in range(gens):
+        solver.step()
+
+        pop = solver.population
+        vals = pop.access_values().detach().cpu().numpy()
+        fits_t = pop.get_evals() if hasattr(pop, "get_evals") else pop.evals
+        fits = fits_t.detach().cpu().numpy()
+        fits = np.where(np.isfinite(fits), fits, -1e9)
+
+        i = int(np.argmax(fits))
+        pop_best = float(fits[i])
+        pop_mean = float(np.mean(fits))
+
+        if pop_best > best_fit:
+            best_fit = pop_best
+            best_theta = vals[i].copy()
+
+        # explicit per-gen progress
+        console.log(f"[blue]gen {g:02d}[/blue] best={pop_best:.4f}  mean={pop_mean:.4f}")
+
+    console.log(f"[yellow]CMA-ES best inner rollout fitness: {best_fit:.4f}[/yellow]")
+    return best_theta
+
+
+# (Original nn_controller kept for reference but unused in final run)
+def nn_controller(
+    model: mj.MjModel,
+    data: mj.MjData,
+) -> npt.NDArray[np.float64]:
+    input_size = len(data.qpos)
+    hidden_size = 8
+    output_size = model.nu
+    w1 = RNG.normal(loc=0.0138, scale=0.5, size=(input_size, hidden_size))
+    w2 = RNG.normal(loc=0.0138, scale=0.5, size=(hidden_size, hidden_size))
+    w3 = RNG.normal(loc=0.0138, scale=0.5, size=(hidden_size, output_size))
+    inputs = data.qpos
+    layer1 = np.tanh(np.dot(inputs, w1))
+    layer2 = np.tanh(np.dot(layer1, w2))
+    outputs = np.tanh(np.dot(layer2, w3))
+    return outputs * np.pi
+
+
+def experiment(
+    robot: Any,
+    controller: Controller,
+    duration: int = 15,
+    mode: ViewerTypes = "viewer",
+) -> None:
+    """Run the simulation with random movements."""
+    # ==================================================================== #
+    mj.set_mjcb_control(None)  # DO NOT REMOVE
+
+    # Initialise world
     world = OlympicArena()
-    world.spawn(core.spec, spawn_position=SPAWN_POS)
+
+    # Spawn robot in the world (outer run can use default bbox correction)
+    world.spawn(robot.spec, spawn_position=SPAWN_POS)
+
+    # Generate the model and data
     model = world.spec.compile()
-    if model.nu == 0:
-        return -1e6, []
     data = mj.MjData(model)
+
+    # Reset state and time of simulation
     mj.mj_resetData(model, data)
 
+    # Pass the model and data to the tracker
+    if controller.tracker is not None:
+        controller.tracker.setup(world.spec, data)
+
+    # Set the control callback function
+    args: list[Any] = []
+    kwargs: dict[Any, Any] = {}
+
+    mj.set_mjcb_control(
+        lambda m, d: controller.set_control(m, d, *args, **kwargs),
+    )
+
+    # ------------------------------------------------------------------ #
+    match mode:
+        case "simple":
+            simple_runner(model, data, duration=duration)
+        case "frame":
+            save_path = str(DATA / "robot.png")
+            single_frame_renderer(model, data, save=True, save_path=save_path)
+        case "video":
+            path_to_video_folder = str(DATA / "videos")
+            video_recorder = VideoRecorder(output_folder=path_to_video_folder)
+            video_renderer(model, data, duration=duration, video_recorder=video_recorder)
+        case "launcher":
+            viewer.launch(model=model, data=data)
+        case "no_control":
+            mj.set_mjcb_control(None)
+            viewer.launch(model=model, data=data)
+    # ==================================================================== #
+
+
+def main() -> None:
+    """Entry point."""
+    # --- Random genotype for NDE ---
+    genotype_size = 64
+    genotype = [
+        RNG.random(genotype_size).astype(np.float32),  # type_p_genes
+        RNG.random(genotype_size).astype(np.float32),  # conn_p_genes
+        RNG.random(genotype_size).astype(np.float32),  # rot_p_genes
+    ]
+
+    nde = NeuralDevelopmentalEncoding(number_of_modules=NUM_OF_MODULES)
+    p_matrices = nde.forward(genotype)
+
+    # Decode the high-probability graph
+    hpd = HighProbabilityDecoder(NUM_OF_MODULES)
+    robot_graph: DiGraph[Any] = hpd.probability_matrices_to_graph(
+        p_matrices[0],
+        p_matrices[1],
+        p_matrices[2],
+    )
+
+    # Save the graph to a file
+    save_graph_as_json(robot_graph, DATA / "robot_graph.json")
+
+    # Build compiled core
+    core = construct_mjspec_from_graph(robot_graph)
+
+    # === Train a CPG controller (CMA-ES) FOR THIS BODY ===
+    console.log("[yellow]Optimizing CPG with CMA-ES for this body...[/yellow]")
+    theta = optimize_cpg_for_core(core, popsize=8, gens=4, sigma_init=0.25)  # bump later
+
+    def cpg_controller(model: mj.MjModel, data: mj.MjData) -> npt.NDArray[np.float64]:
+        return make_cpg_controller_from_params(theta, model)(model, data)
+
+    # Tracker (unchanged)
     tracker = Tracker(mj.mjtObj.mjOBJ_GEOM, "core")
-    tracker.setup(world.spec, data)
 
-    ctrl = Controller(controller_callback_function=nn_controller, tracker=tracker)
-    mj.set_mjcb_control(lambda m, d: ctrl.set_control(m, d))
+    # Simulate the robot with the optimized CPG
+    ctrl = Controller(controller_callback_function=cpg_controller, tracker=tracker)
 
-    simple_runner(model, data, duration=SIM_DURATION, steps_per_loop=100)
+    video_dir = DATA / "videos"
+    console.log(f"[cyan]Saving video to: {video_dir}[/cyan]")
+    experiment(robot=core, controller=ctrl, mode="video", duration=10)
+    console.log("[green]Video render complete.[/green]")
 
-    xpos_history = tracker.history.get("xpos", {})
-    if not xpos_history or 0 not in xpos_history:
-        return -1e6, []
-    hist = xpos_history[0]
-    return fitness_function(hist), hist
-
-
-### EA loop
-def run_ea():
-    mj.set_mjcb_control(None)
-    population = [random_genotype() for _ in range(POP_SIZE)]
-    fitnesses, histories = [], []
-
-    for i, gen in enumerate(population):
-        fit, his = evaluate_genotype(gen)
-        fitnesses.append(fit)
-        histories.append(his)
-        #FOR DEBUGGING:
-        #print(f"startinng pop {i} fitness: {fit:.4f}")
-
-    for gen_idx in range(GENS):
-        print(f"\n=== Generation {gen_idx+1} ===")
-
-        #calculate probs for roulette parent selection
-        f_arr = np.array(fitnesses)
-        weights = f_arr - f_arr.min() + 1e-6 #make all values positive and lowest fitness ~ 0
-        probs = weights / weights.sum()
-
-        #create pop size children and perform crossover and matation
-        children = []
-        while len(children) < POP_SIZE:
-            pa, pb = RNG.choice(len(population), size=2, replace=False, p=probs)
-            c1, c2 = crossover_per_chromosome(population[pa], population[pb])
-            children.append(gaussian_mutation(c1))
-            if len(children) < POP_SIZE:
-                children.append(gaussian_mutation(c2))
-
-        #calculate fitness for each child
-        child_fitnesses, child_histories = [], []
-        for i, chi in enumerate(children):
-            fit, his = evaluate_genotype(chi)
-            child_fitnesses.append(fit)
-            child_histories.append(his)
-            #FOR DEBUGGING:
-            #print(f"Child {i} fitness: {fit:.4f}")
-
-        #perform elitist survivor selection
-        combined = population + children
-        combined_fit = fitnesses + child_fitnesses
-        combined_hist = histories + child_histories
-
-        order = np.argsort(combined_fit)[::-1][:POP_SIZE]
-        population = [combined[i] for i in order]
-        fitnesses = [combined_fit[i] for i in order]
-        histories = [combined_hist[i] for i in order]
-
-        print("Survivors:")
-        for r, f in enumerate(fitnesses):
-            print(f"{r+1}: {f:.4f}")
-
-    best_idx = int(np.argmax(fitnesses))
-    best_gen, best_hist, best_fit = population[best_idx], histories[best_idx], fitnesses[best_idx]
-    print("\n=== EA finished ===")
-    print(f"Best fitness: {best_fit:.4f}")
-
-    #save best robot json
-    robot_graph, core = decode_and_build(best_gen)
-    save_graph_as_json(robot_graph, OUTPUT / "best_robot.json")
-    print(f"Saved best robot graph to {OUTPUT/'best_robot.json'}")
-
-    #save best robot video
-    mj.set_mjcb_control(None)
-    world = OlympicArena()
-    world.spawn(core.spec, spawn_position=SPAWN_POS)
-    model = world.spec.compile()
-    data = mj.MjData(model)
-    mj.mj_resetData(model, data)
-
-    tracker = Tracker(mj.mjtObj.mjOBJ_GEOM, "core")
-    tracker.setup(world.spec, data)
-
-    ctrl = Controller(controller_callback_function=nn_controller, tracker=tracker)
-    mj.set_mjcb_control(lambda m, d: ctrl.set_control(m, d))
-
-    video_folder = OUTPUT / "videos"
-    video_folder.mkdir(exist_ok=True)
-    recorder = VideoRecorder(output_folder=str(video_folder))
-    video_renderer(model, data, duration=SIM_DURATION, video_recorder=recorder)
-    print(f"Saved video of best robot to {video_folder}")
-
-    return best_gen, best_hist, best_fit
+    # Plot & fitness if we recorded a trajectory
+    hist_ok = tracker.history.get("xpos") and len(tracker.history["xpos"][0]) > 1
+    if hist_ok:
+        show_xpos_history(tracker.history["xpos"][0])
+        fitness = fitness_function(tracker.history["xpos"][0])
+        console.log(f"[green]Fitness of CPG-optimized robot: {fitness:.4f}[/green]")
+    else:
+        console.log("[yellow]No recorded trajectory to plot.[/yellow]")
 
 
 if __name__ == "__main__":
-    run_ea()
+    main()
