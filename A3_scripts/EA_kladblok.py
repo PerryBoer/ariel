@@ -258,34 +258,32 @@ def optimize_cpg_cma_for_body(model: mj.MjModel, seconds: float = 6.0, pop: int 
 
 # ---------- Evaluation (modified to train CPG per body) ----------
 def evaluate(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray]) -> tuple[float, "DiGraph"]:
-    """Decode → build (train spec) → train CPG via CMA-ES → build (eval spec) → simulate with tracker → fitness."""
-    # Decode body once
+    """Decode → build → train CPG via CMA-ES → simulate with tracker → fitness."""
     hpd = HighProbabilityDecoder(NUM_OF_MODULES)
     p_type, p_conn, p_rot = nde.forward(genotype)
     robot_graph: "DiGraph" = hpd.probability_matrices_to_graph(p_type, p_conn, p_rot)
+    core = construct_mjspec_from_graph(robot_graph)
 
-    # --- TRAIN: build a TRAIN spec, attach it once, and optimize CPG on its compiled model
-    core_train = construct_mjspec_from_graph(robot_graph)
-    train_world = OlympicArena()
-    train_world.spawn(core_train.spec, spawn_position=SPAWN_POS)   # attaches core_train.spec to train_world
-    train_model = train_world.spec.compile()
+    # Compile model for THIS body
+    world = OlympicArena()
+    world.spawn(core.spec, spawn_position=SPAWN_POS)
+    model = world.spec.compile()
 
-    theta = optimize_cpg_cma_for_body(train_model, seconds=6.0, pop=30, gens=15)
+    # Inner-loop: train a CPG for this specific body
+    theta = optimize_cpg_cma_for_body(model, seconds=6.0, pop=30, gens=15)
 
-    # --- EVAL: build a FRESH spec for the tracked evaluation (do NOT reuse the attached spec)
-    core_eval = construct_mjspec_from_graph(robot_graph)
-
+    # Now re-run a normal tracked experiment (your existing pipeline) with best CPG
     def cpg_callback(m: mj.MjModel, d: mj.MjData) -> npt.NDArray[np.float64]:
+        # we piggyback on Controller which calls this each step; return d.ctrl after updating
         cb = make_cpg_controller(theta, m)
         cb(m, d)
         return d.ctrl
 
     tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
     ctrl = Controller(controller_callback_function=cpg_callback, tracker=tracker)
+    experiment(robot=core, controller=ctrl, duration=6)
 
-    # This spawns and compiles core_eval.spec for the *first and only* time.
-    experiment(robot=core_eval, controller=ctrl, duration=6)
-
+    # Use your original fitness on the tracked history
     hist = tracker.history["xpos"][0]
     fit = fitness_function(hist)
     return fit, robot_graph
