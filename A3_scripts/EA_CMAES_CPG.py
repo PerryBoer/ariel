@@ -2,7 +2,7 @@
 
 # ---------- Imports ----------
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, List
 import math
 import numpy as np
 import numpy.typing as npt
@@ -49,16 +49,21 @@ TARGET_POSITION = [5, 0, 0.5]
 GENOTYPE_SIZE = 64
 
 # Outer EA loop parameters (evolving the body)
-POP_SIZE = 6
-N_GEN = 50
-ELITISM_SIZE = 2 # Best n always kept for the next generation
-PARENT_POOLSIZE = 3 # Best n to be used as a pool for parent selection
-SIM_TIME_STAGES = [10.0, 20.0, 40.0, 60.0] # Dynamic simulation time based on gen num
+POP_SIZE = 8
+N_GEN = 20
+CX_PROB = 0.5 #DIT OPTIMALISEREN
+MUT_PROB = 0.3 #DIT OPTIMALISEREN
+MUT_SIGMA = 0.3 #DIT OPTIMALISEREN
+ELITISM_SIZE = 1 # Best n always kept for the next generation (IK DENK DAT 1 OF 2 GOED IS)
+PICK_PARENTS_BETA = 5 #higher value -> favors higher fitnesses to be picked as parents #DIT OPTIMALISEREN
+if N_GEN > 30:
+    SIM_TIME_STAGES = [10.0, 20.0, 40.0, 60.0] # Dynamic simulation time based on gen num (per 25% of total generations)
+else: SIM_TIME_STAGES = [10.0, 10.0, 15.0, 20.0] #DIT EVEN OM MAKKELIJK KORTERE SIMULATIES TE RUNNEN
 
 #Inner EA loop parameters (evolving the CPG/brain)
 MIN_VIABLE_MOVEMENT = 0.015 # Mimimal movement in a random 6s simulation to be viable
-CPG_TRAINING_POP = 20 
-CPG_TRAINING_GENS = 15
+CPG_TRAINING_POP = 20 #WE KUNNEN DIT NOG HOGER ZETTEN? MAAR DENK IK NIET NODIG
+CPG_TRAINING_GENS = 15 #WE KUNNEN DIT NOG HOGER ZETTEN? MAAR DENK IK NIET NODIG
 PHASE_MIN, PHASE_MAX = -math.pi, math.pi
 AMP_MIN, AMP_MAX     = 0.0, 1.0
 FREQ_MIN, FREQ_MAX   = 0.4, 2.0
@@ -118,28 +123,43 @@ def experiment(robot: Any, controller: Controller, duration: int, record: bool =
 
 # ---------- Genotype operations ----------
 def random_genotype() -> list[np.ndarray]:
+    """Initialize random genotype vectors"""
     return [
         RNG.random(GENOTYPE_SIZE).astype(np.float32),
         RNG.random(GENOTYPE_SIZE).astype(np.float32),
         RNG.random(GENOTYPE_SIZE).astype(np.float32),
     ]
 
-def crossover(g1: list[np.ndarray], g2: list[np.ndarray]) -> list[np.ndarray]:
-    child = []
-    for v1, v2 in zip(g1, g2):
-        cx = RNG.integers(1, GENOTYPE_SIZE - 1)
-        new_v = np.concatenate([v1[:cx], v2[cx:]])
-        child.append(new_v)
-    return child
+def one_point_crossover(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Perform one-point crossover between two genotype vectors (of the same type)"""
+    L = a.size
+    point = int(RNG.integers(1, L))
+    c1 = np.concatenate([a[:point], b[point:]])
+    c2 = np.concatenate([b[:point], a[point:]])
+    return c1.astype(np.float32), c2.astype(np.float32)
 
-def mutate(geno: list[np.ndarray], pm: float = 0.1, sigma: float = 0.1) -> list[np.ndarray]:
-    new = []
-    for v in geno:
-        mask = RNG.random(v.shape) < pm
-        noise = RNG.normal(0, sigma, size=v.shape)
-        mutated = np.clip(v + mask * noise, 0.0, 1.0)
-        new.append(mutated.astype(np.float32))
-    return new
+def crossover_per_chromosome(pa: list[np.ndarray], pb: list[np.ndarray], cx_prob: float) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """From two parents, perform one-point crossover for each of the three vector types"""
+    child1, child2 = [], []
+    for idx in range(3):
+        if RNG.random() < cx_prob:
+            ca, cb = one_point_crossover(pa[idx], pb[idx])
+            child1.append(ca)
+            child2.append(cb)
+        else:
+            child1.append(pa[idx].copy())
+            child2.append(pb[idx].copy())
+    return child1, child2
+
+def gaussian_mutation(gen: list[np.ndarray], mut_prob: float, sigma: float) -> list[np.ndarray]:
+    """Perform gaussian mutation on a genotype"""
+    mutated = []
+    for chrom in gen:
+        to_mut = RNG.random(len(chrom)) < mut_prob #determine which genes get mutated
+        noise = RNG.normal(loc=0.0, scale=sigma, size=len(chrom)).astype(np.float32) #generate gaussian noise for each gene
+        new_chrom = np.clip(chrom + noise * to_mut, 0.0, 1.0) #apply noise only when gene is mutated
+        mutated.append(new_chrom.astype(np.float32))
+    return mutated
 
 def _find_core_geom_id(model: mj.MjModel) -> int | None:
     # Best-effort: find a geom with 'core' in its name for tracking last xyz
@@ -293,7 +313,7 @@ def decode_and_build(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray
 
 def check_viability(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray], min_viable_movement:float):
     """Run a 6 sec random simulation and check if the robot has moved > threshold"""
-    robot_graph, core = decode_and_build(nde,genotype)
+    _, core = decode_and_build(nde,genotype)
 
     mj.set_mjcb_control(None)
     world = OlympicArena()
@@ -322,13 +342,12 @@ def check_viability(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray]
 # ---------- Evaluation (modified to train CPG per body) ----------
 def evaluate(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray], sim_time: float) -> tuple[float, "DiGraph", np.ndarray]:
     """Check viability -> if viable train CPG via CMA-ES -> simulate with tracker -> fitness."""
-    #check viability
-    # Step 1: Check viability
+    # Check viability
     viable, hist = check_viability(nde, genotype, MIN_VIABLE_MOVEMENT)
     if not viable:
         # Return bad fitness and empty graph/theta for non-viable bodies
         console.log("[bold red]Body was not viable, skipping CPG training[/bold red]")
-        return -1e6, None, None
+        return -10, None, None #return very low fitness for non viable bodies
     
     hpd = HighProbabilityDecoder(NUM_OF_MODULES)
     p_type, p_conn, p_rot = nde.forward(genotype)
@@ -361,19 +380,50 @@ def evaluate(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray], sim_t
 
     experiment(robot=core, controller=ctrl, duration=sim_time)
 
-    # Use your original fitness on the tracked history
+    # Use original fitness on the tracked history
     hist = tracker.history["xpos"][0]
-    fit = fitness_function(hist) #THIS IS THE RETURNED FITNESS FOR THIS BODY
+    fit = fitness_function(hist)
     return fit, robot_graph, theta
 
-# ---------- GA main ----------
-def main() -> None:
-    nde = NeuralDevelopmentalEncoding(number_of_modules=NUM_OF_MODULES)
-    console.log(f"[bold cyan]Starting minimal GA (CMA-ES CPG inside) for {N_GEN} generations, pop={POP_SIZE}[/bold cyan]")
 
-    population = [random_genotype() for _ in range(POP_SIZE)]
+# ---------- Initialize viable population ----------
+def initialize_viable_population(nde: NeuralDevelopmentalEncoding, pop_size: int)-> list[np.ndarray]:
+    population = []
+
+    while len(population) < pop_size:
+        geno = random_genotype()
+        viable, _ = check_viability(nde, geno, MIN_VIABLE_MOVEMENT)
+        if viable:
+            population.append(geno)
+
+    return population
+
+# ---------- Probabilistic parent selection ----------
+def pick_parents(population: list[np.ndarray], fitnesses: list[float], beta: float):
+    """Pick one parent from population with probability exp(beta * fitness)."""
+    shifted = fitnesses - fitnesses.min() #shift so lowest fitness is 0
+    probs = np.exp(beta * shifted)
+    probs /= probs.sum()
+    idx1 = RNG.choice(len(population), p=probs)
+    # try up to 10 times to pick a different parent
+    for attempt in range(10):
+        idx2 = RNG.choice(len(population), p=probs)
+        if idx2 != idx1:
+            break
+    else:
+        idx2 = idx1
+        print(f"[yellow]Warning: Could not pick distinct parent after 10 attempts, using same parent twice[/yellow]")
+
+    return population[idx1], population[idx2]
+
+# ---------- EA main ----------
+def main() -> None:
+    nde = NeuralDevelopmentalEncoding(number_of_modules=NUM_OF_MODULES) # Set NDE once, constant for entire run
+    console.log(f"[bold cyan]Starting EA with CMA-ES CPG for {N_GEN} generations, pop={POP_SIZE}[/bold cyan]")
+
+    #population = [random_genotype() for _ in range(POP_SIZE)]
+    population = initialize_viable_population(nde, POP_SIZE)
     best_fit = -np.inf
-    best_geno = None
     best_graph = None
     best_theta = None
 
@@ -396,22 +446,19 @@ def main() -> None:
             fitnesses[i] = fit
             console.log(f"Robot {i:02d} → fitness = {fit:.4f} (sim time {sim_time:.1f}s)")
             if fit > best_fit:
-                best_fit, best_geno, best_graph, best_theta = fit, geno, graph, theta
+                best_fit, best_graph, best_theta = fit, graph, theta
 
-        # Parent selection (elitism)
+        # Parent selection (elitism and probabilistic)
         sorted_idx = np.argsort(fitnesses)
-        elite_idx = sorted_idx[-2:] #top-2 elites are always kept for the next generation
+        elite_idx = sorted_idx[-ELITISM_SIZE:] #top-n elites are always kept for the next generation
         elites = [population[i] for i in elite_idx]
         console.log(f"Best fitness={fitnesses[elite_idx[-1]]:.4f}")
-
-        parent_pool_idx = sorted_idx[-PARENT_POOLSIZE:]   # top-5 are used as a pool for parent selection
-        parent_pool = [population[i] for i in parent_pool_idx]
-
         new_pop = elites.copy()
         while len(new_pop) < POP_SIZE:
-            p1, p2 = RNG.choice(parent_pool, 2, replace=True)
-            child = crossover(p1, p2)
-            child = mutate(child, pm=0.1, sigma=0.08)
+            #p1, p2 = RNG.choice(parent_pool, 2, replace=True)
+            p1, p2 = pick_parents(population, fitnesses, beta=PICK_PARENTS_BETA)
+            child = crossover_per_chromosome(p1, p2, CX_PROB)[0] #only use one of the two children
+            child = gaussian_mutation(child, MUT_PROB, MUT_SIGMA)
             new_pop.append(child)
         population = new_pop
 
