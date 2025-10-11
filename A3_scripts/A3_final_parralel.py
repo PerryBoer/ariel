@@ -5,23 +5,31 @@ staged sim times, CSV, videos, JSON) EXACTLY the same, and replaces the inner-lo
 with the Body-Agnostic NA-CPG (one oscillator per actuator) trained by CMA-ES per body.
 
 Inner-loop CMA-ES optimizes theta = [phase_0..phase_{nu-1}, AMP, FREQ].
-NA-CPG parameters & behavior follow the user’s spec:
+
+NA-CPG parameters & behavior (updated):
 - Controller smoothing inside Controller: alpha = 0.6
 - Internal oscillator alpha ≈ 0.45, COUP = 0.08
-- Defaults: amplitudes[:] = 0.9, w[:] = 2π*1.5 Hz, phase[:] = 0.0
-- Mapping: oscillator output → joint center ± half-span (respect actuator ctrlrange), then clip
-- Bounds on theta: phase ∈ [-π, π], AMP ∈ [0.0, 1.5], FREQ ∈ [0.8, 3.0]
+- Defaults: w[:] = 2π*1.5 Hz, phase[:] = 0.0
+- NEW AMP semantics (recommended): AMP ∈ [0,1] = fraction of each joint’s half-range
+  Mapping: y_unit ∈ [-1,1] → target = center + half * (AMP * y_unit), then clip to ctrlrange
+  This allows using the **entire actuator range** cleanly when AMP → 1.
+- Bounds on theta: phase ∈ [-π, π], AMP ∈ [0.0, 1.0], FREQ ∈ [0.8, 3.0]
 """
 
 # ---------- Imports ----------
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Dict, Tuple, Optional
 import math
+import json
 import numpy as np
 import numpy.typing as npt
 import mujoco as mj
 import csv
 from datetime import datetime
+
+# [PARALLEL]
+from concurrent.futures import ProcessPoolExecutor
+import os
 
 import torch
 from torch import nn
@@ -44,6 +52,11 @@ from ariel.utils.tracker import Tracker
 from ariel.utils.video_recorder import VideoRecorder
 from ariel.utils.renderers import video_renderer
 
+try:
+    from mujoco import viewer as mjviewer  # optional viewer for quick testing
+except Exception:
+    mjviewer = None
+
 if TYPE_CHECKING:
     from networkx import DiGraph
 
@@ -64,7 +77,7 @@ GENOTYPE_SIZE = 64
 
 # Outer EA loop parameters (evolving the body)  ---- (UNCHANGED)
 POP_SIZE = 3
-N_GEN = 2
+N_GEN = 1
 CX_PROB = 0.5
 MUT_PROB = 0.3
 MUT_SIGMA = 0.3
@@ -75,7 +88,7 @@ if N_GEN > 30:
 else:
     SIM_TIME_STAGES = [10.0, 10.0, 15.0, 20.0]
 
-# Inner EA loop parameters (per-body CMA-ES)  ---- outer defaults kept, NA-CPG uses its own bounds
+# Inner EA loop parameters (per-body CMA-ES)
 MIN_VIABLE_MOVEMENT = 0.015
 CPG_TRAINING_POP = 2
 CPG_TRAINING_GENS = 1
@@ -89,10 +102,13 @@ SMOOTH_ALPHA         = 0.5  # kept, but NA-CPG replay uses Controller(alpha=0.6)
 # NA-CPG controller smoothing (as per user spec)
 CTRL_ALPHA = 0.6
 
-# NA-CPG theta bounds (as per user spec)
+# NA-CPG theta bounds (AMP is fraction of half-range)
 NA_PHASE_MIN, NA_PHASE_MAX = -math.pi, math.pi
-NA_AMP_MIN,   NA_AMP_MAX   = 0.0, 1.5
+NA_AMP_MIN,   NA_AMP_MAX   = 0.0, 1.0      # <<< changed to 1.0 to unlock full ctrlrange
 NA_FREQ_MIN,  NA_FREQ_MAX  = 0.8, 3.0
+
+# Optional viewer
+LAUNCH_VIEWER = True  # set False for headless runs
 
 # Timestamp for output files
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -132,17 +148,34 @@ def fitness_function(history: list[list[float]]) -> float:
 
 
 # ---------- Simulation ----------
-def experiment(robot: Any, controller: Controller, duration: int, record: bool = False) -> None:
+def experiment(robot: Any, controller: Controller, duration: float, record: bool = False,
+               warmup_seconds: float = 0.75) -> None:
+    """Run a sim with an optional warm-up so CPG reaches its limit cycle before we track/record."""
     mj.set_mjcb_control(None)
     world = OlympicArena()
     world.spawn(robot.spec, position=SPAWN_POS)
     model = world.spec.compile()
     data = mj.MjData(model)
     mj.mj_resetData(model, data)
+
+    # Attach tracker
     if controller.tracker is not None:
         controller.tracker.setup(world.spec, data)
+
+    # Install controller callback (Controller handles smoothing)
     mj.set_mjcb_control(lambda m, d: controller.set_control(m, d))
 
+    # --- Warm-up (no saving, no recording) ---
+    if warmup_seconds and warmup_seconds > 0:
+        steps_per_sec = int(round(1.0 / model.opt.timestep))
+        n_warm = max(1, int(round(warmup_seconds * steps_per_sec)))
+        for _ in range(n_warm):
+            mj.mj_step(model, data)
+        # Clear tracker history after warm-up
+        if controller.tracker is not None:
+            controller.tracker.reset()
+
+    # --- Main run ---
     if record:
         video_folder = str(DATA / "videos")
         recorder = VideoRecorder(output_folder=video_folder)
@@ -213,6 +246,9 @@ class BodyAgnosticNACPG(nn.Module):
     """
     One oscillator per actuator. Oscillator outputs mapped to each joint's center ± half-span.
     Internal coupling COUP = 0.08. Radial gain alpha ≈ 0.45 by default.
+
+    IMPORTANT: step() returns *unit* oscillator output in [-1,1] (no AMP, no π/2 scaling).
+               control_callback() does the only scaling: center + half * (AMP * y_unit).
     """
     def __init__(
         self,
@@ -232,7 +268,8 @@ class BodyAgnosticNACPG(nn.Module):
 
         # Evolvable params (set per rollout)
         self.phase = nn.Parameter(torch.zeros(self.n), requires_grad=False)
-        self.amplitudes = nn.Parameter(torch.full((self.n,), 0.9), requires_grad=False)
+        # amplitudes now used as a FRACTION of half-range (0..1), but only in control mapping (not in step)
+        self.amplitudes = nn.Parameter(torch.full((self.n,), 1.0), requires_grad=False)
         self.w = nn.Parameter(torch.full((self.n,), 2.0 * math.pi * 1.5), requires_grad=False)  # ~1.5 Hz
 
         # Buffers for oscillator state (x,y) per joint
@@ -257,7 +294,7 @@ class BodyAgnosticNACPG(nn.Module):
         self._ctrl_hi = model.actuator_ctrlrange[:, 1].astype(np.float64)
 
     def step(self) -> np.ndarray:
-        """Advance oscillators one MuJoCo step and return normalized outputs in [-1,1] per joint."""
+        """Advance oscillators one MuJoCo step and return *unit* outputs y_unit ∈ [-1, 1] per joint."""
         n = self.n
         xy = self.xy
         xyd = self.xy_dot_old
@@ -319,25 +356,74 @@ class BodyAgnosticNACPG(nn.Module):
         self.xy = new_xy
         self.xy_dot_old = new_xyd
 
-        # Use y as the oscillator output; scale by amplitudes, then normalize to [-1,1] by π/2 mapping at Controller
-        out = (self.amplitudes * self.xy[:, 1]).detach().cpu().numpy()
-        # normalize to [-1,1] by dividing by (π/2) when mapping to ctrl
-        return np.clip(out / (np.pi / 2.0), -1.0, 1.0)
+        # Use y as oscillator output; just bound to [-1,1]. No AMP here.
+        y_unit = torch.clamp(self.xy[:, 1], -1.0, 1.0).detach().cpu().numpy()
+        return y_unit
 
     def control_callback(self, model: mj.MjModel) -> Any:
+        """Return a target-only callback; the Controller handles smoothing."""
         if self._ctrl_lo is None:
             self._bind_ranges(model)
         lo, hi = self._ctrl_lo, self._ctrl_hi
         center = 0.5 * (hi + lo)
-        half = 0.5 * (hi - lo)
+        half   = 0.5 * (hi - lo)  # e.g., π/2
 
-        def _cb(_m: mj.MjModel, d: mj.MjData) -> npt.NDArray[np.float64]:
-            # advance NA-CPG one step and return target controls (Controller will smooth with alpha=0.6)
-            y_norm = self.step()  # [-1,1]
-            target = center + half * y_norm
+        def _cb(_m: mj.MjModel, _d: mj.MjData) -> npt.NDArray[np.float64]:
+            y_unit = self.step()  # [-1, 1]
+            amp = float(self.amplitudes[0].detach().cpu().item()) if self.amplitudes.numel() > 0 else 1.0
+            amp = float(np.clip(amp, NA_AMP_MIN, NA_AMP_MAX))  # fraction of half-range
+            y_scaled = amp * y_unit
+            target = center + half * y_scaled
             return np.clip(target, lo, hi)
 
         return _cb
+
+
+# ---------- Controller factory for replay/video ----------
+def make_na_cpg_controller_for_video(best_theta: np.ndarray, seed: int = SEED):
+    """
+    Builds NA-CPG on first call and returns target controls (Controller handles smoothing).
+    Prints one-time diagnostics: nu, dt, steps_per_sec, ctrl alpha, ctrl rate, ctrlrange head, AMP/FREQ.
+    """
+    state: dict[str, Any] = {"cb": None}
+
+    def _video_cb(m: mj.MjModel, d: mj.MjData) -> npt.NDArray[np.float64]:
+        if (state["cb"] is None) or (d.time == 0.0):
+            nu = int(m.nu)
+            if nu == 0:
+                return np.zeros(0, dtype=np.float64)
+
+            phases = np.clip(best_theta[:nu], NA_PHASE_MIN, NA_PHASE_MAX)
+            AMP    = float(np.clip(best_theta[nu],     NA_AMP_MIN,  NA_AMP_MAX))   # fraction of half-range
+            FREQ   = float(np.clip(best_theta[nu + 1], NA_FREQ_MIN, NA_FREQ_MAX))
+            omega  = 2.0 * math.pi * FREQ
+
+            cpg = BodyAgnosticNACPG.from_model(m, alpha=0.45, seed=seed)
+            with torch.inference_mode():
+                cpg.phase[:]      = torch.from_numpy(phases.astype(np.float32))
+                cpg.amplitudes[:] = AMP
+                cpg.w[:]          = omega
+
+            # ---- sanity prints (one-time) ----
+            dt = float(m.opt.timestep)
+            steps_per_sec = int(round(1.0 / dt))
+            lo = m.actuator_ctrlrange[:, 0]
+            hi = m.actuator_ctrlrange[:, 1]
+            head = min(4, nu)
+            console.log(
+                "[sanity] nu="
+                + str(nu)
+                + f"  dt={dt:.5f}s  steps_per_sec≈{steps_per_sec}  "
+                  f"AMP(frac)={AMP:.3f}  FREQ={FREQ:.3f}  omega={omega:.3f}  "
+                  "ctrlrange[:{}]= ".format(head)
+                + ", ".join([f"[{lo[i]:.3f},{hi[i]:.3f}]" for i in range(head)])
+            )
+
+            state["cb"] = cpg.control_callback(m)
+
+        return state["cb"](m, d)
+
+    return _video_cb
 
 
 # ---------- CMA-ES Problem using NA-CPG ----------
@@ -352,7 +438,7 @@ class BodyCPGProblem(Problem):
         nu = int(model.nu)
         L = (nu + 2) if nu > 0 else 2  # AMP,FREQ even if no actuators (won't be used)
 
-        # NA-CPG bounds
+        # NA-CPG bounds (AMP fractional)
         lo = np.concatenate([np.full(nu, NA_PHASE_MIN), [NA_AMP_MIN], [NA_FREQ_MIN]]).astype(np.float64)
         hi = np.concatenate([np.full(nu, NA_PHASE_MAX), [NA_AMP_MAX], [NA_FREQ_MAX]]).astype(np.float64)
 
@@ -377,7 +463,7 @@ class BodyCPGProblem(Problem):
 
         # Clamp theta and assign NA-CPG params
         phases = np.clip(theta[:nu], NA_PHASE_MIN, NA_PHASE_MAX)
-        AMP  = float(np.clip(theta[nu],     NA_AMP_MIN,  NA_AMP_MAX))
+        AMP  = float(np.clip(theta[nu],     NA_AMP_MIN,  NA_AMP_MAX))   # fraction
         FREQ = float(np.clip(theta[nu + 1], NA_FREQ_MIN, NA_FREQ_MAX))
         omega = 2.0 * math.pi * FREQ
 
@@ -388,12 +474,10 @@ class BodyCPGProblem(Problem):
             cpg.amplitudes[:] = AMP
             cpg.w[:] = omega
 
-        # RAW MuJoCo control callback (no Controller, no tracker)
-        # Controller smoothing (alpha=0.6) is applied only in replay/video runs.
+        # RAW MuJoCo control callback (no Controller, no tracker, no extra smoothing)
         raw_cb = cpg.control_callback(self.model)
 
         def mjcb(_m: mj.MjModel, d: mj.MjData):
-            # Write targets directly into d.ctrl (what Controller would return)
             d.ctrl[:] = raw_cb(_m, d)
 
         mj.set_mjcb_control(mjcb)
@@ -406,7 +490,6 @@ class BodyCPGProblem(Problem):
                 if self.core_gid is not None:
                     xyz_last = data.geom_xpos[self.core_gid].copy()
                 else:
-                    # body root (qpos first 3) as fallback
                     xyz_last = np.array([
                         float(data.qpos[0]),
                         float(data.qpos[1]),
@@ -448,8 +531,7 @@ def optimize_cpg_cma_for_body(model: mj.MjModel, seconds: float = 6.0, pop: int 
         return np.array([0.5, 1.0], dtype=np.float64)  # AMP, FREQ (unused)
 
     prob = BodyCPGProblem(model, sim_seconds=seconds)
-    # safe center: phases=0, AMP=0.8 (within [0,1.5]), FREQ=1.5 (within [0.8,3.0])
-    center = np.concatenate([np.zeros(nu), [0.8], [1.5]]).astype(np.float64)
+    center = np.concatenate([np.zeros(nu), [0.8], [1.5]]).astype(np.float64)  # AMP starts at 0.8 (80% of half-range)
 
     solver = CMAES(
         prob,
@@ -534,6 +616,34 @@ def check_viability(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray]
     return viability, hist
 
 
+# ---------- [PARALLEL] graph-based viability for workers ----------
+def check_viability_from_graph(robot_graph, min_viable_movement: float):
+    """Run a 6s random simulation on a decoded graph and check if movement > threshold."""
+    core = construct_mjspec_from_graph(robot_graph)
+
+    mj.set_mjcb_control(None)
+    world = OlympicArena()
+    world.spawn(core.spec, position=SPAWN_POS)
+    model = world.spec.compile()
+    data = mj.MjData(model)
+    mj.mj_resetData(model, data)
+
+    tracker = Tracker(mj.mjtObj.mjOBJ_GEOM, "core")
+    tracker.setup(world.spec, data)
+
+    ctrl = Controller(controller_callback_function=nn_controller, tracker=tracker)
+    mj.set_mjcb_control(lambda m, d: ctrl.set_control(m, d))
+
+    simple_runner(model, data, duration=6, steps_per_loop=100)
+    xpos_history = tracker.history.get("xpos", {})
+    hist = xpos_history[0]
+    pos_3 = hist[3]
+    pos_final = hist[-1]
+    pos_diff = pos_3 - pos_final
+    viability = (abs(pos_diff[0]) > min_viable_movement or abs(pos_diff[1]) > min_viable_movement)
+    return viability, hist
+
+
 # ---------- Evaluation (train NA-CPG per body) ----------
 def evaluate(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray], sim_time: float) -> tuple[float, "DiGraph", np.ndarray]:
     """Check viability -> if viable train NA-CPG via CMA-ES -> simulate with tracker -> fitness."""
@@ -548,7 +658,7 @@ def evaluate(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray], sim_t
     robot_graph: "DiGraph" = hpd.probability_matrices_to_graph(p_type, p_conn, p_rot)
     core = construct_mjspec_from_graph(robot_graph)
 
-    # Compile model for THIS body
+    # Compile model for THIS body (training happens on this model)
     mj.set_mjcb_control(None)
     world = OlympicArena()
     world.spawn(core.spec, position=SPAWN_POS)
@@ -558,23 +668,19 @@ def evaluate(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray], sim_t
     theta = optimize_cpg_cma_for_body(model, seconds=sim_time, pop=CPG_TRAINING_POP, gens=CPG_TRAINING_GENS)
 
     # Re-run tracked experiment using trained NA-CPG
-    def na_cpg_callback_factory(m: mj.MjModel) -> Any:
-        nu = int(m.nu)
-        phases = np.clip(theta[:nu], NA_PHASE_MIN, NA_PHASE_MAX) if nu > 0 else np.zeros(0, dtype=np.float64)
-        AMP  = float(np.clip(theta[nu] if nu > 0 else 0.8, NA_AMP_MIN, NA_AMP_MAX))
-        FREQ = float(np.clip(theta[nu + 1] if nu > 0 else 1.5, NA_FREQ_MIN, NA_FREQ_MAX))
-        omega = 2.0 * math.pi * FREQ
-
-        cpg = BodyAgnosticNACPG.from_model(m, alpha=0.45, seed=SEED)
-        with torch.inference_mode():
-            if nu > 0:
-                cpg.phase[:] = torch.from_numpy(phases.astype(np.float32))
-                cpg.amplitudes[:] = AMP
-                cpg.w[:] = omega
-        return cpg.control_callback(m)
-
     tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
-    ctrl = Controller(controller_callback_function=na_cpg_callback_factory(model), tracker=tracker, alpha=CTRL_ALPHA)
+
+    # single-smoothing: Controller handles low-pass at explicit control rate (~100 Hz)
+    steps_per_sec = int(round(1.0 / model.opt.timestep))
+    steps_per_ctrl = max(1, steps_per_sec // 100)
+    console.log(f"[sanity] Controller alpha={CTRL_ALPHA}  steps_per_ctrl={steps_per_ctrl} (~{steps_per_sec/steps_per_ctrl:.1f} Hz)")
+
+    ctrl = Controller(
+        controller_callback_function=make_na_cpg_controller_for_video(theta, seed=SEED),
+        tracker=tracker,
+        alpha=CTRL_ALPHA,
+        time_steps_per_ctrl_step=steps_per_ctrl,
+    )
 
     # Rebuild core/spec fresh for the tracked replay (avoids compile reuse issues)
     p_type, p_conn, p_rot = nde.forward(genotype)
@@ -587,6 +693,61 @@ def evaluate(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray], sim_t
     hist = tracker.history["xpos"][0]
     fit = fitness_function(hist)
     return fit, robot_graph, theta
+
+
+# ---------- [PARALLEL] worker for graph -> fitness, theta ----------
+def _evaluate_worker_from_graph(args):
+    """
+    args: (robot_graph, sim_time, seed_offset)
+    Returns: (fitness: float, robot_graph, theta: np.ndarray|None)
+    """
+    robot_graph, sim_time, seed_offset = args
+
+    # Keep workers lean on CPU threading
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+    # Viability check on decoded graph
+    viable, _ = check_viability_from_graph(robot_graph, MIN_VIABLE_MOVEMENT)
+    if not viable:
+        return -10.0, robot_graph, None
+
+    # Build model in worker
+    mj.set_mjcb_control(None)
+    core = construct_mjspec_from_graph(robot_graph)
+    world = OlympicArena()
+    world.spawn(core.spec, position=SPAWN_POS)
+    model = world.spec.compile()
+
+    # Train NA-CPG
+    theta = optimize_cpg_cma_for_body(
+        model, seconds=sim_time, pop=CPG_TRAINING_POP, gens=CPG_TRAINING_GENS
+    )
+
+    # Replay with Controller(alpha=0.6) + Tracker("core") at explicit control rate
+    data = mj.MjData(model)
+    mj.mj_resetData(model, data)
+    tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
+    tracker.setup(world.spec, data)
+
+    steps_per_sec = int(round(1.0 / model.opt.timestep))
+    steps_per_ctrl = max(1, steps_per_sec // 100)
+    console.log(f"[sanity] (worker) Controller alpha={CTRL_ALPHA}  steps_per_ctrl={steps_per_ctrl} (~{steps_per_sec/steps_per_ctrl:.1f} Hz)")
+
+    ctrl = Controller(
+        controller_callback_function=make_na_cpg_controller_for_video(theta, seed=SEED + int(seed_offset)),
+        tracker=tracker,
+        alpha=CTRL_ALPHA,
+        time_steps_per_ctrl_step=steps_per_ctrl,
+    )
+    mj.set_mjcb_control(lambda m, d: ctrl.set_control(m, d))
+    try:
+        simple_runner(model, data, duration=sim_time)
+    finally:
+        mj.set_mjcb_control(None)
+
+    hist = tracker.history["xpos"][0]
+    fit = fitness_function(hist)
+    return float(fit), robot_graph, theta
 
 
 # ---------- Initialize viable population ----------
@@ -640,12 +801,31 @@ def main() -> None:
     # Main EA loop
     for gen in range(N_GEN):
         console.rule(f"[bold green]Generation {gen}[/bold green]")
-        console.log(f"[outer EA] gen={gen}/{N_GEN-1} sim_time={get_sim_time_for_gen(gen):.1f}s pop={len(population)}")
         sim_time = get_sim_time_for_gen(gen)
-        fitnesses = np.zeros(POP_SIZE)
+        console.log(f"[outer EA] gen={gen}/{N_GEN-1} sim_time={sim_time:.1f}s pop={len(population)}")
 
-        for i, geno in enumerate(population):
-            fit, graph, theta = evaluate(nde, geno, sim_time)
+        # [PARALLEL] Pre-decode ALL genotypes to graphs in the MAIN process
+        hpd = HighProbabilityDecoder(NUM_OF_MODULES)
+        decoded_graphs = []
+        for geno in population:
+            p_type, p_conn, p_rot = nde.forward(geno)
+            G = hpd.probability_matrices_to_graph(p_type, p_conn, p_rot)
+            decoded_graphs.append(G)
+
+        # [PARALLEL] Evaluate across bodies in parallel processes
+        MAX_WORKERS = max(1, (os.cpu_count() or 1) - 1)
+        results = [None] * len(population)
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = []
+            for i, G in enumerate(decoded_graphs):
+                seed_offset = gen * POP_SIZE + i
+                futures.append(ex.submit(_evaluate_worker_from_graph, (G, sim_time, seed_offset)))
+            for i, fut in enumerate(futures):
+                results[i] = fut.result()
+
+        # Unpack results, record best, print as before
+        fitnesses = np.zeros(POP_SIZE)
+        for i, (fit, graph, theta) in enumerate(results):
             fitnesses[i] = fit
             console.log(f"Robot {i:02d} → fitness = {fit:.4f} (sim time {sim_time:.1f}s)")
             if fit > best_fit and graph is not None and theta is not None:
@@ -670,40 +850,36 @@ def main() -> None:
             writer.writerow([gen, best_fit])
 
         # Save video at 4 checkpoints
-        if (gen + 1) % (N_GEN // 4) == 0 and best_graph is not None and best_theta is not None:
+        if (N_GEN >= 4) and ((gen + 1) % (N_GEN // 4) == 0) and best_graph is not None and best_theta is not None:
             console.log(f"[yellow]Checkpoint: recording video at generation {gen+1}[/yellow]")
             best_core = construct_mjspec_from_graph(best_graph)
 
-            def na_cpg_video_controller(m: mj.MjModel, d: mj.MjData) -> npt.NDArray[np.float64]:
-                # Build NA-CPG once per callback install
-                nu = int(m.nu)
-                phases = np.clip(best_theta[:nu], NA_PHASE_MIN, NA_PHASE_MAX) if nu > 0 else np.zeros(0, dtype=np.float64)
-                AMP  = float(np.clip(best_theta[nu] if nu > 0 else 0.8, NA_AMP_MIN, NA_AMP_MAX))
-                FREQ = float(np.clip(best_theta[nu + 1] if nu > 0 else 1.5, NA_FREQ_MIN, NA_FREQ_MAX))
-                omega = 2.0 * math.pi * FREQ
-
-                # cache on closure
-                if not hasattr(na_cpg_video_controller, "_cb"):
-                    cpg = BodyAgnosticNACPG.from_model(m, alpha=0.45, seed=SEED)
-                    with torch.inference_mode():
-                        if nu > 0:
-                            cpg.phase[:] = torch.from_numpy(phases.astype(np.float32))
-                            cpg.amplitudes[:] = AMP
-                            cpg.w[:] = omega
-                    na_cpg_video_controller._cb = cpg.control_callback(m)
-
-                # Return target; Controller(alpha=0.6) will smooth
-                cb = na_cpg_video_controller._cb
-                return cb(m, d)
+            # compile here to compute correct control rate
+            mj.set_mjcb_control(None)
+            world = OlympicArena()
+            world.spawn(best_core.spec, position=SPAWN_POS)
+            model = world.spec.compile()
+            data = mj.MjData(model)
 
             tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
-            ctrl = Controller(controller_callback_function=na_cpg_video_controller, tracker=tracker, alpha=CTRL_ALPHA)
+            tracker.setup(world.spec, data)
+
+            steps_per_sec = int(round(1.0 / float(model.opt.timestep)))
+            steps_per_ctrl = max(1, steps_per_sec // 100)
+
+            ctrl = Controller(
+                controller_callback_function=make_na_cpg_controller_for_video(best_theta, seed=SEED),
+                tracker=tracker,
+                alpha=CTRL_ALPHA,
+                time_steps_per_ctrl_step=steps_per_ctrl,
+            )
 
             video_folder = DATA / "videos"
             video_folder.mkdir(exist_ok=True)
-            video_file = video_folder / f"video_gen{gen+1}_{TIMESTAMP}.mp4"
-            experiment(robot=best_core, controller=ctrl, duration=sim_time, record=True)
-            console.log(f"[green]Saved checkpoint video → {video_file}[/green]")
+            recorder = VideoRecorder(output_folder=str(video_folder))
+            console.log("[yellow]Recording checkpoint video…[/yellow]")
+            video_renderer(model, data, duration=sim_time, video_recorder=recorder)
+            console.log(f"[green]Saved checkpoint video to {video_folder}[/green]")
 
     # ---------- After final generation ----------
     console.rule("[bold magenta]Final best robot[/bold magenta]")
@@ -717,14 +893,15 @@ def main() -> None:
         save_graph_as_json(best_graph, graph_folder / graph_file)
         print(f"\nSaved best robot graph to {graph_folder / graph_file}")
 
-    # Save video for best robot with trained NA-CPG
+    # Save video for best robot with trained NA-CPG + viewer (90 seconds)
     if best_graph is not None and best_theta is not None:
-        best_core = construct_mjspec_from_graph(best_graph)
+        # Fresh spec for video (keeps behavior deterministic & avoids stale spec)
+        best_core_vid = construct_mjspec_from_graph(best_graph)
 
         def na_cpg_video_controller(m: mj.MjModel, d: mj.MjData) -> npt.NDArray[np.float64]:
             nu = int(m.nu)
             phases = np.clip(best_theta[:nu], NA_PHASE_MIN, NA_PHASE_MAX) if nu > 0 else np.zeros(0, dtype=np.float64)
-            AMP  = float(np.clip(best_theta[nu] if nu > 0 else 0.8, NA_AMP_MIN, NA_AMP_MAX))
+            AMP  = float(np.clip(best_theta[nu] if nu > 0 else 0.8, NA_AMP_MIN, NA_AMP_MAX))   # fraction of half-range
             FREQ = float(np.clip(best_theta[nu + 1] if nu > 0 else 1.5, NA_FREQ_MIN, NA_FREQ_MAX))
             omega = 2.0 * math.pi * FREQ
 
@@ -735,18 +912,79 @@ def main() -> None:
                         cpg.phase[:] = torch.from_numpy(phases.astype(np.float32))
                         cpg.amplitudes[:] = AMP
                         cpg.w[:] = omega
+                # Diagnostics once per install (helps verify actuator ranges)
+                lo = m.actuator_ctrlrange[:, 0]
+                hi = m.actuator_ctrlrange[:, 1]
+                console.log(f"nu={nu} ctrlrange[:{min(4,nu)}]= " +
+                            ", ".join([f"[{lo[i]:.3f},{hi[i]:.3f}]" for i in range(min(4, nu))]) +
+                            f" | AMP(frac)={AMP:.3f} FREQ={FREQ:.3f}")
                 na_cpg_video_controller._cb = cpg.control_callback(m)
 
-            cb = na_cpg_video_controller._cb
-            return cb(m, d)
+            return na_cpg_video_controller._cb(m, d)
+
+        # Compile to compute correct control rate
+        mj.set_mjcb_control(None)
+        world = OlympicArena()
+        world.spawn(best_core_vid.spec, position=SPAWN_POS)
+        model = world.spec.compile()
+        data = mj.MjData(model)
 
         tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
-        ctrl = Controller(controller_callback_function=na_cpg_video_controller, tracker=tracker, alpha=CTRL_ALPHA)
-        console.log("[yellow]Recording video of best robot...[/yellow]")
+        tracker.setup(world.spec, data)
+
+        steps_per_sec = int(round(1.0 / float(model.opt.timestep)))
+        steps_per_ctrl = max(1, steps_per_sec // 100)
+
+        ctrl = Controller(controller_callback_function=na_cpg_video_controller,
+                          tracker=tracker, alpha=CTRL_ALPHA,
+                          time_steps_per_ctrl_step=steps_per_ctrl)
+
+        console.log("[yellow]Recording video of best robot (90s)…[/yellow]")
         video_folder = DATA / "videos"
         video_folder.mkdir(exist_ok=True)
-        experiment(robot=best_core, controller=ctrl, duration=get_sim_time_for_gen(N_GEN - 1), record=True)
-        console.log(f"[green]All done! Video and graph saved.[/green], at {video_folder}")
+        recorder = VideoRecorder(output_folder=str(video_folder))
+        video_renderer(model, data, duration=90.0, video_recorder=recorder)
+        console.log(f"[green]All done! Video and graph saved.[/green] at {video_folder}")
+
+        # -------- Interactive viewer (fresh spec again) --------
+        try:
+            console.log("[magenta]Launching interactive viewer with best θ… close the window to finish.[/magenta]")
+            mj.set_mjcb_control(None)
+            world = OlympicArena()
+            best_core_view = construct_mjspec_from_graph(best_graph)  # fresh spec for viewer
+            world.spawn(best_core_view.spec, position=SPAWN_POS)
+            model = world.spec.compile()
+            data = mj.MjData(model)
+
+            tracker_v = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
+            tracker_v.setup(world.spec, data)
+
+            def _viewer_cb_factory(m: mj.MjModel) -> Any:
+                nu = int(m.nu)
+                phases = np.clip(best_theta[:nu], NA_PHASE_MIN, NA_PHASE_MAX) if nu > 0 else np.zeros(0, dtype=np.float64)
+                AMP  = float(np.clip(best_theta[nu] if nu > 0 else 0.8, NA_AMP_MIN, NA_AMP_MAX))
+                FREQ = float(np.clip(best_theta[nu + 1] if nu > 0 else 1.5, NA_FREQ_MIN, NA_FREQ_MAX))
+                omega = 2.0 * math.pi * FREQ
+                cpg = BodyAgnosticNACPG.from_model(m, alpha=0.45, seed=SEED)
+                with torch.inference_mode():
+                    if nu > 0:
+                        cpg.phase[:] = torch.from_numpy(phases.astype(np.float32))
+                        cpg.amplitudes[:] = AMP
+                        cpg.w[:] = omega
+                return cpg.control_callback(m)
+
+            ctrl_v = Controller(controller_callback_function=_viewer_cb_factory(model),
+                                tracker=tracker_v, alpha=CTRL_ALPHA,
+                                time_steps_per_ctrl_step=max(1, int(round(1.0 / float(model.opt.timestep))) // 100))
+            mj.set_mjcb_control(lambda m, d: ctrl_v.set_control(m, d))
+
+            try:
+                from mujoco import viewer as mjviewer
+                mjviewer.launch(model, data)  # blocks until window closed
+            finally:
+                mj.set_mjcb_control(None)
+        except Exception as e:
+            console.log(f"[red]Viewer launch failed: {e}[/red]")
     else:
         console.log("[red]No viable best_graph/best_theta to render.[/red]")
 
