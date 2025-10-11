@@ -124,7 +124,8 @@ def main() -> None:
     def evaluate_distance() -> float:
         # tracker.history["xpos"] is a list of tracked bodies; take index 0 (core)
         xy_last = tracker.history["xpos"][0][-1]
-        loss = distance_to_target((float(xy_last[0]), float(xy_last[1])), TARGET_XY)
+        xy_last = (float(xy_last[0]), float(xy_last[1]))
+        return distance_to_target(xy_last, TARGET_XY)
 
     # =================== Optimization loop ===================
     for it in range(optimizer.budget):
