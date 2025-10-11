@@ -13,7 +13,7 @@ NA-CPG parameters & behavior (updated):
 - NEW AMP semantics (recommended): AMP ∈ [0,1] = fraction of each joint’s half-range
   Mapping: y_unit ∈ [-1,1] → target = center + half * (AMP * y_unit), then clip to ctrlrange
   This allows using the **entire actuator range** cleanly when AMP → 1.
-- Bounds on theta: phase ∈ [-π, π], AMP ∈ [0.0, 1.0], FREQ ∈ [0.8, 3.0]
+- Bounds on theta: phase ∈ [-π, π], AMP ∈ [0.0, 1.0], FREQ ∈ [0.6, 3.0]
 """
 
 # ---------- Imports ----------
@@ -36,7 +36,7 @@ from torch import nn
 from evotorch import Problem
 from evotorch.algorithms import CMAES
 from evotorch.core import SolutionBatch
-from evotorch.logging import StdOutLogger
+from evotorch.logging import StdOutLogger  # harmless if unused
 
 from ariel import console
 from ariel.body_phenotypes.robogen_lite.constructor import construct_mjspec_from_graph
@@ -76,12 +76,12 @@ TARGET_POSITION = [5, 0, 0.5]
 GENOTYPE_SIZE = 64
 
 # Outer EA loop parameters (evolving the body)  ---- (UNCHANGED)
-POP_SIZE = 3
-N_GEN = 1
-CX_PROB = 0.5
-MUT_PROB = 0.3
-MUT_SIGMA = 0.3
-ELITISM_SIZE = 2
+POP_SIZE = 14
+N_GEN = 15
+CX_PROB = 0.6
+MUT_PROB = 0.5
+MUT_SIGMA = 0.25
+ELITISM_SIZE = 3
 PICK_PARENTS_BETA = 5
 if N_GEN > 30:
     SIM_TIME_STAGES = [10.0, 20.0, 40.0, 60.0]
@@ -90,8 +90,8 @@ else:
 
 # Inner EA loop parameters (per-body CMA-ES)
 MIN_VIABLE_MOVEMENT = 0.015
-CPG_TRAINING_POP = 2
-CPG_TRAINING_GENS = 1
+CPG_TRAINING_POP = 16
+CPG_TRAINING_GENS = 10
 
 # Teammate globals (kept; NA-CPG enforces its own):
 PHASE_MIN, PHASE_MAX = -math.pi, math.pi
@@ -104,8 +104,8 @@ CTRL_ALPHA = 0.6
 
 # NA-CPG theta bounds (AMP is fraction of half-range)
 NA_PHASE_MIN, NA_PHASE_MAX = -math.pi, math.pi
-NA_AMP_MIN,   NA_AMP_MAX   = 0.0, 1.0      # <<< changed to 1.0 to unlock full ctrlrange
-NA_FREQ_MIN,  NA_FREQ_MAX  = 0.8, 3.0
+NA_AMP_MIN,   NA_AMP_MAX   = 0.0, 1.0
+NA_FREQ_MIN,  NA_FREQ_MAX  = 0.6, 3.0
 
 # Optional viewer
 LAUNCH_VIEWER = True  # set False for headless runs
@@ -361,20 +361,59 @@ class BodyAgnosticNACPG(nn.Module):
         return y_unit
 
     def control_callback(self, model: mj.MjModel) -> Any:
-        """Return a target-only callback; the Controller handles smoothing."""
-        if self._ctrl_lo is None:
-            self._bind_ranges(model)
-        lo, hi = self._ctrl_lo, self._ctrl_hi
-        center = 0.5 * (hi + lo)
-        half   = 0.5 * (hi - lo)  # e.g., π/2
+        """
+        Returns a target-only callback. TARGET MAPPING NOW USES JOINT RANGE, not actuator ctrlrange.
+
+        For each actuator:
+          - find its driven hinge joint via actuator_trnid
+          - use that joint's jnt_range as [lo_joint, hi_joint]
+          - if range is degenerate/unlimited, default to [-π/2, +π/2]
+        Final target = center_joint + half_joint * (AMP * y_unit), then clip to actuator_ctrlrange.
+        """
+        # --- Resolve actuator->joint mapping and ranges (cached once) ---
+        if not hasattr(self, "_map_built"):
+            nu = int(model.nu)
+            self._lo_joint = np.zeros(nu, dtype=np.float64)
+            self._hi_joint = np.zeros(nu, dtype=np.float64)
+            self._lo_ctrl  = model.actuator_ctrlrange[:, 0].astype(np.float64)
+            self._hi_ctrl  = model.actuator_ctrlrange[:, 1].astype(np.float64)
+
+            # actuator_trnid: shape (nu, 2), first entry is joint id when actuator targets a joint
+            trn = model.actuator_trnid
+            for a in range(nu):
+                j = int(trn[a, 0])
+                # Guard: invalid target or non-hinge → default to ±π/2
+                use_default = True
+                if 0 <= j < model.njnt:
+                    if model.jnt_type[j] == mj.mjtJoint.mjJNT_HINGE:
+                        lo, hi = model.jnt_range[j]
+                        # If unlimited or tiny span, fall back
+                        if np.isfinite(lo) and np.isfinite(hi) and (abs(hi - lo) > 1e-6):
+                            self._lo_joint[a] = float(lo)
+                            self._hi_joint[a] = float(hi)
+                            use_default = False
+                if use_default:
+                    self._lo_joint[a] = -math.pi / 2.0
+                    self._hi_joint[a] = +math.pi / 2.0
+
+            # no range dump; keep quiet
+            self._map_built = True
+
+        lo_j, hi_j = self._lo_joint, self._hi_joint
+        lo_c, hi_c = self._lo_ctrl,  self._hi_ctrl
+        center_j = 0.5 * (hi_j + lo_j)
+        half_j   = 0.5 * (hi_j - lo_j)
 
         def _cb(_m: mj.MjModel, _d: mj.MjData) -> npt.NDArray[np.float64]:
-            y_unit = self.step()  # [-1, 1]
+            # oscillator output in [-1,1]
+            y_unit = self.step()
+            # AMP is fraction of half-joint-range
             amp = float(self.amplitudes[0].detach().cpu().item()) if self.amplitudes.numel() > 0 else 1.0
-            amp = float(np.clip(amp, NA_AMP_MIN, NA_AMP_MAX))  # fraction of half-range
-            y_scaled = amp * y_unit
-            target = center + half * y_scaled
-            return np.clip(target, lo, hi)
+            amp = float(np.clip(amp, NA_AMP_MIN, NA_AMP_MAX))
+            # intent uses joint range
+            target = center_j + half_j * (amp * y_unit)
+            # safety clip to actuator ctrlrange (should be ≥ joint span if actuator allows it)
+            return np.clip(target, lo_c, hi_c)
 
         return _cb
 
@@ -383,7 +422,7 @@ class BodyAgnosticNACPG(nn.Module):
 def make_na_cpg_controller_for_video(best_theta: np.ndarray, seed: int = SEED):
     """
     Builds NA-CPG on first call and returns target controls (Controller handles smoothing).
-    Prints one-time diagnostics: nu, dt, steps_per_sec, ctrl alpha, ctrl rate, ctrlrange head, AMP/FREQ.
+    Minimal one-time diagnostics: nu, dt, steps_per_sec, AMP, FREQ, omega.
     """
     state: dict[str, Any] = {"cb": None}
 
@@ -404,19 +443,14 @@ def make_na_cpg_controller_for_video(best_theta: np.ndarray, seed: int = SEED):
                 cpg.amplitudes[:] = AMP
                 cpg.w[:]          = omega
 
-            # ---- sanity prints (one-time) ----
+            # ---- minimal sanity print (no ctrlrange) ----
             dt = float(m.opt.timestep)
             steps_per_sec = int(round(1.0 / dt))
-            lo = m.actuator_ctrlrange[:, 0]
-            hi = m.actuator_ctrlrange[:, 1]
-            head = min(4, nu)
             console.log(
-                "[sanity] nu="
+                "nu="
                 + str(nu)
                 + f"  dt={dt:.5f}s  steps_per_sec≈{steps_per_sec}  "
-                  f"AMP(frac)={AMP:.3f}  FREQ={FREQ:.3f}  omega={omega:.3f}  "
-                  "ctrlrange[:{}]= ".format(head)
-                + ", ".join([f"[{lo[i]:.3f},{hi[i]:.3f}]" for i in range(head)])
+                  f"AMP={AMP:.3f}  FREQ={FREQ:.3f}  omega={omega:.3f}"
             )
 
             state["cb"] = cpg.control_callback(m)
@@ -531,15 +565,18 @@ def optimize_cpg_cma_for_body(model: mj.MjModel, seconds: float = 6.0, pop: int 
         return np.array([0.5, 1.0], dtype=np.float64)  # AMP, FREQ (unused)
 
     prob = BodyCPGProblem(model, sim_seconds=seconds)
-    center = np.concatenate([np.zeros(nu), [0.8], [1.5]]).astype(np.float64)  # AMP starts at 0.8 (80% of half-range)
+
+    # Better center: small phase jitter, AMP near full half-range
+    phase_center = RNG.uniform(-0.2, 0.2, size=nu) if nu > 0 else np.zeros(0, dtype=np.float64)
+    center = np.concatenate([phase_center, [0.95], [1.5]]).astype(np.float64)
 
     solver = CMAES(
         prob,
         popsize=max(10, int(pop)),
-        stdev_init=0.3,
+        stdev_init=0.35,
         center_init=torch.from_numpy(center),
     )
-    _ = StdOutLogger(solver, interval=1)
+    # No StdOutLogger: keep output minimal
 
     best_theta = center.copy()
     best_eval = float("inf")
@@ -569,7 +606,7 @@ def optimize_cpg_cma_for_body(model: mj.MjModel, seconds: float = 6.0, pop: int 
             best_eval = float(fits[i])
             best_theta = vals[i].copy()
 
-        # diagnostics
+        # minimal inner-loop progress line
         console.log(
             f"[inner CMA gen {g:02d}] source={eval_source} pop={len(vals)} "
             f"min={np.min(fits):.4f} mean={np.mean(fits):.4f} max={np.max(fits):.4f}"
@@ -813,7 +850,7 @@ def main() -> None:
             decoded_graphs.append(G)
 
         # [PARALLEL] Evaluate across bodies in parallel processes
-        MAX_WORKERS = max(1, (os.cpu_count() or 1) - 1)
+        MAX_WORKERS = max(1, os.cpu_count() - 1)
         results = [None] * len(population)
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = []
@@ -895,13 +932,12 @@ def main() -> None:
 
     # Save video for best robot with trained NA-CPG + viewer (90 seconds)
     if best_graph is not None and best_theta is not None:
-        # Fresh spec for video (keeps behavior deterministic & avoids stale spec)
         best_core_vid = construct_mjspec_from_graph(best_graph)
 
         def na_cpg_video_controller(m: mj.MjModel, d: mj.MjData) -> npt.NDArray[np.float64]:
             nu = int(m.nu)
             phases = np.clip(best_theta[:nu], NA_PHASE_MIN, NA_PHASE_MAX) if nu > 0 else np.zeros(0, dtype=np.float64)
-            AMP  = float(np.clip(best_theta[nu] if nu > 0 else 0.8, NA_AMP_MIN, NA_AMP_MAX))   # fraction of half-range
+            AMP  = float(np.clip(best_theta[nu] if nu > 0 else 1.0, NA_AMP_MIN, NA_AMP_MAX))  # fraction
             FREQ = float(np.clip(best_theta[nu + 1] if nu > 0 else 1.5, NA_FREQ_MIN, NA_FREQ_MAX))
             omega = 2.0 * math.pi * FREQ
 
@@ -912,39 +948,20 @@ def main() -> None:
                         cpg.phase[:] = torch.from_numpy(phases.astype(np.float32))
                         cpg.amplitudes[:] = AMP
                         cpg.w[:] = omega
-                # Diagnostics once per install (helps verify actuator ranges)
-                lo = m.actuator_ctrlrange[:, 0]
-                hi = m.actuator_ctrlrange[:, 1]
-                console.log(f"nu={nu} ctrlrange[:{min(4,nu)}]= " +
-                            ", ".join([f"[{lo[i]:.3f},{hi[i]:.3f}]" for i in range(min(4, nu))]) +
-                            f" | AMP(frac)={AMP:.3f} FREQ={FREQ:.3f}")
                 na_cpg_video_controller._cb = cpg.control_callback(m)
-
             return na_cpg_video_controller._cb(m, d)
 
-        # Compile to compute correct control rate
-        mj.set_mjcb_control(None)
-        world = OlympicArena()
-        world.spawn(best_core_vid.spec, position=SPAWN_POS)
-        model = world.spec.compile()
-        data = mj.MjData(model)
-
         tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
-        tracker.setup(world.spec, data)
-
-        steps_per_sec = int(round(1.0 / float(model.opt.timestep)))
-        steps_per_ctrl = max(1, steps_per_sec // 100)
-
-        ctrl = Controller(controller_callback_function=na_cpg_video_controller,
-                          tracker=tracker, alpha=CTRL_ALPHA,
-                          time_steps_per_ctrl_step=steps_per_ctrl)
+        ctrl = Controller(
+            controller_callback_function=na_cpg_video_controller,
+            tracker=tracker,
+            alpha=CTRL_ALPHA,
+            time_steps_per_ctrl_step=1,  # experiment() recomputes from compiled dt
+        )
 
         console.log("[yellow]Recording video of best robot (90s)…[/yellow]")
-        video_folder = DATA / "videos"
-        video_folder.mkdir(exist_ok=True)
-        recorder = VideoRecorder(output_folder=str(video_folder))
-        video_renderer(model, data, duration=90.0, video_recorder=recorder)
-        console.log(f"[green]All done! Video and graph saved.[/green] at {video_folder}")
+        experiment(robot=best_core_vid, controller=ctrl, duration=90.0, record=True)
+        console.log("[green]All done! Video and graph saved.[/green]")
 
         # -------- Interactive viewer (fresh spec again) --------
         try:
