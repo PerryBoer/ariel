@@ -75,6 +75,9 @@ NUM_OF_MODULES = 30
 TARGET_POSITION = [5, 0, 0.5]
 GENOTYPE_SIZE = 64
 
+# <<< NEW: batch physics steps per Python call for non-video runs >>>
+STEPS_PER_LOOP = 200
+
 # Outer EA loop parameters (evolving the body)  ---- (UNCHANGED)
 POP_SIZE = 14
 N_GEN = 15
@@ -90,8 +93,8 @@ else:
 
 # Inner EA loop parameters (per-body CMA-ES)
 MIN_VIABLE_MOVEMENT = 0.015
-CPG_TRAINING_POP = 16
-CPG_TRAINING_GENS = 10
+CPG_TRAINING_POP = 10
+CPG_TRAINING_GENS = 8
 
 # Teammate globals (kept; NA-CPG enforces its own):
 PHASE_MIN, PHASE_MAX = -math.pi, math.pi
@@ -181,7 +184,8 @@ def experiment(robot: Any, controller: Controller, duration: float, record: bool
         recorder = VideoRecorder(output_folder=video_folder)
         video_renderer(model, data, duration=duration, video_recorder=recorder)
     else:
-        simple_runner(model, data, duration=duration)
+        # <<< batched stepping for speed >>>
+        simple_runner(model, data, duration=duration, steps_per_loop=STEPS_PER_LOOP)
 
 
 # ---------- Genotype operations ----------
@@ -293,71 +297,75 @@ class BodyAgnosticNACPG(nn.Module):
         self._ctrl_lo = model.actuator_ctrlrange[:, 0].astype(np.float64)
         self._ctrl_hi = model.actuator_ctrlrange[:, 1].astype(np.float64)
 
-    def step(self) -> np.ndarray:
-        """Advance oscillators one MuJoCo step and return *unit* outputs y_unit ∈ [-1, 1] per joint."""
+    # <<< NEW: build rotation cache once per rollout >>>
+    def _prepare_rotations(self):
+        """Precompute rotation matrices R[i,j] from fixed phases; call once per rollout."""
         n = self.n
-        xy = self.xy
-        xyd = self.xy_dot_old
+        phi = self.phase.detach().cpu().numpy().astype(np.float64)
+        dphi = phi.reshape(n, 1) - phi.reshape(1, n)
+        c = np.cos(dphi); s = np.sin(dphi)
 
-        # Rotation matrices for phase coupling
-        r = torch.zeros(n, n, 2, 2, dtype=xy.dtype)
-        I = torch.eye(2, dtype=xy.dtype)
+        R = np.empty((n, n, 2, 2), dtype=np.float64)
+        R[:, :, 0, 0] = c;   R[:, :, 0, 1] = -s
+        R[:, :, 1, 0] = s;   R[:, :, 1, 1] =  c
+
+        dev = self.xy.device
+        self._R = torch.from_numpy(R).to(dev, dtype=self.xy.dtype)
+
+        # neighbor index tensors per i
+        self._adj_masks = []
         for i in range(n):
-            for j in range(n):
-                if i == j:
-                    r[i, j] = I
-                else:
-                    d = self.phase[i] - self.phase[j]
-                    c, s = torch.cos(d), torch.sin(d)
-                    r[i, j, 0, 0] = c
-                    r[i, j, 0, 1] = -s
-                    r[i, j, 1, 0] = s
-                    r[i, j, 1, 1] = c
-
-        COUP = 0.08
-        new_xy = torch.empty_like(xy)
-        new_xyd = torch.empty_like(xyd)
-
-        for i in range(n):
-            xi, yi = xy[i]
-            xdot_old, ydot_old = xyd[i]
-            r2 = xi * xi + yi * yi
-            a = self.alpha * (1.0 - r2)
-            b = self.w[i]
-
-            # local dynamics (Hopf-like)
-            local_xdot = a * xi - b * yi
-            local_ydot = b * xi + a * yi
-
-            # coupling term (average of neighbors)
-            coup = torch.zeros(2, dtype=xy.dtype)
             nbrs = self.adjacency[i]
-            if len(nbrs) > 0:
-                for j in nbrs:
-                    coup += COUP * torch.mv(r[i, j], xy[j])
-                coup /= float(len(nbrs))
+            self._adj_masks.append(torch.tensor(nbrs, device=dev, dtype=torch.long))
 
-            xdot = local_xdot + coup[0]
-            ydot = local_ydot + coup[1]
+    # <<< REPLACED: vectorized & cached rotation use >>>
+    def step(self) -> np.ndarray:
+        """Advance oscillators one step with cached rotations; return y_unit in [-1,1]."""
+        n = self.n
+        xy = self.xy                  # (n,2)
+        xyd = self.xy_dot_old         # (n,2)
+        R = self._R                   # (n,n,2,2)
+        COUP = 0.08
+        dt = self.dt
 
-            # mild rate limiting
+        # local dynamics (Hopf-like), vectorized
+        x = xy[:, 0]; y = xy[:, 1]
+        r2 = x * x + y * y
+        a = self.alpha * (1.0 - r2)
+        b = self.w
+
+        local_xdot = a * x - b * y
+        local_ydot = b * x + a * y
+
+        new_xdot = torch.empty_like(x)
+        new_ydot = torch.empty_like(y)
+
+        # neighbor coupling with einsum; average per i
+        for i in range(n):
+            nbr_idx = self._adj_masks[i]
+            if nbr_idx.numel() > 0:
+                # rot = R[i, nbrs] @ xy[nbrs] -> (k,2)
+                rot = torch.einsum('kij,kj->ki', R[i, nbr_idx], xy[nbr_idx])
+                coup = (COUP / float(nbr_idx.numel())) * rot.sum(dim=0)  # (2,)
+                xdot = local_xdot[i] + coup[0]
+                ydot = local_ydot[i] + coup[1]
+            else:
+                xdot = local_xdot[i]
+                ydot = local_ydot[i]
+
+            # mild rate limiting (kept)
             diff = 10.0
-            xdot = torch.clamp(xdot, xdot_old - diff, xdot_old + diff)
-            ydot = torch.clamp(ydot, ydot_old - diff, ydot_old + diff)
+            new_xdot[i] = torch.clamp(xdot, xyd[i, 0] - diff, xyd[i, 0] + diff)
+            new_ydot[i] = torch.clamp(ydot, xyd[i, 1] - diff, xyd[i, 1] + diff)
 
-            new_x = xi + self.dt * xdot
-            new_y = yi + self.dt * ydot
+        # integrate in-place
+        xy[:, 0] = x + dt * new_xdot
+        xy[:, 1] = y + dt * new_ydot
+        xyd[:, 0] = new_xdot
+        xyd[:, 1] = new_ydot
 
-            new_xy[i, 0] = new_x
-            new_xy[i, 1] = new_y
-            new_xyd[i, 0] = xdot
-            new_xyd[i, 1] = ydot
-
-        self.xy = new_xy
-        self.xy_dot_old = new_xyd
-
-        # Use y as oscillator output; just bound to [-1,1]. No AMP here.
-        y_unit = torch.clamp(self.xy[:, 1], -1.0, 1.0).detach().cpu().numpy()
+        # output
+        y_unit = torch.clamp(xy[:, 1], -1.0, 1.0).detach().cpu().numpy()
         return y_unit
 
     def control_callback(self, model: mj.MjModel) -> Any:
@@ -396,8 +404,10 @@ class BodyAgnosticNACPG(nn.Module):
                     self._lo_joint[a] = -math.pi / 2.0
                     self._hi_joint[a] = +math.pi / 2.0
 
-            # no range dump; keep quiet
             self._map_built = True
+
+        # <<< NEW: build rotation cache once per rollout >>>
+        self._prepare_rotations()
 
         lo_j, hi_j = self._lo_joint, self._hi_joint
         lo_c, hi_c = self._lo_ctrl,  self._hi_ctrl
@@ -641,7 +651,8 @@ def check_viability(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray]
     ctrl = Controller(controller_callback_function=nn_controller, tracker=tracker)
     mj.set_mjcb_control(lambda m, d: ctrl.set_control(m, d))
 
-    simple_runner(model, data, duration=6, steps_per_loop=100)
+    # <<< batched stepping for speed >>>
+    simple_runner(model, data, duration=6, steps_per_loop=STEPS_PER_LOOP)
     xpos_history = tracker.history.get("xpos", {})
     hist = xpos_history[0]
 
@@ -671,7 +682,8 @@ def check_viability_from_graph(robot_graph, min_viable_movement: float):
     ctrl = Controller(controller_callback_function=nn_controller, tracker=tracker)
     mj.set_mjcb_control(lambda m, d: ctrl.set_control(m, d))
 
-    simple_runner(model, data, duration=6, steps_per_loop=100)
+    # <<< batched stepping for speed >>>
+    simple_runner(model, data, duration=6, steps_per_loop=STEPS_PER_LOOP)
     xpos_history = tracker.history.get("xpos", {})
     hist = xpos_history[0]
     pos_3 = hist[3]
@@ -778,7 +790,8 @@ def _evaluate_worker_from_graph(args):
     )
     mj.set_mjcb_control(lambda m, d: ctrl.set_control(m, d))
     try:
-        simple_runner(model, data, duration=sim_time)
+        # <<< batched stepping for speed >>>
+        simple_runner(model, data, duration=sim_time, steps_per_loop=STEPS_PER_LOOP)
     finally:
         mj.set_mjcb_control(None)
 
