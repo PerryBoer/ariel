@@ -49,21 +49,21 @@ TARGET_POSITION = [5, 0, 0.5]
 GENOTYPE_SIZE = 64
 
 # Outer EA loop parameters (evolving the body)
-POP_SIZE = 8
-N_GEN = 20
-CX_PROB = 0.5 #DIT OPTIMALISEREN
-MUT_PROB = 0.3 #DIT OPTIMALISEREN
-MUT_SIGMA = 0.3 #DIT OPTIMALISEREN
-ELITISM_SIZE = 1 # Best n always kept for the next generation (IK DENK DAT 1 OF 2 GOED IS)
-PICK_PARENTS_BETA = 5 #higher value -> favors higher fitnesses to be picked as parents #DIT OPTIMALISEREN
+POP_SIZE = 10
+N_GEN = 100
+CX_PROB = 0.6
+MUT_PROB = 0.5 
+MUT_SIGMA = 0.1
+ELITISM_SIZE = 2 # Best n always kept for the next generation
+PICK_PARENTS_BETA = 5 #higher value -> favors higher fitnesses to be picked as parents
 if N_GEN > 30:
-    SIM_TIME_STAGES = [10.0, 20.0, 40.0, 60.0] # Dynamic simulation time based on gen num (per 25% of total generations)
-else: SIM_TIME_STAGES = [10.0, 10.0, 15.0, 20.0] #DIT EVEN OM MAKKELIJK KORTERE SIMULATIES TE RUNNEN
+    SIM_TIME_STAGES = [10.0, 20.0, 50.0, 80.0] #dynamic simulation time based on gen num (per 25% of total generations)
+else: SIM_TIME_STAGES = [10.0, 10.0, 15.0, 20.0] #for test-running short runs
 
 #Inner EA loop parameters (evolving the CPG/brain)
 MIN_VIABLE_MOVEMENT = 0.015 # Mimimal movement in a random 6s simulation to be viable
-CPG_TRAINING_POP = 20 #WE KUNNEN DIT NOG HOGER ZETTEN? MAAR DENK IK NIET NODIG
-CPG_TRAINING_GENS = 15 #WE KUNNEN DIT NOG HOGER ZETTEN? MAAR DENK IK NIET NODIG
+CPG_TRAINING_POP = 10
+CPG_TRAINING_GENS = 15 
 PHASE_MIN, PHASE_MAX = -math.pi, math.pi
 AMP_MIN, AMP_MAX     = 0.0, 1.0
 FREQ_MIN, FREQ_MAX   = 0.4, 2.0
@@ -85,7 +85,7 @@ def get_sim_time_for_gen(gen: int, total_gens: int = N_GEN) -> float:
     else:
         return SIM_TIME_STAGES[3]
 
-# ---------- Random controller (kept for viability check) ----------
+# ---------- Random controller (kept for body viability check) ----------
 def nn_controller(model: mj.MjModel, data: mj.MjData) -> npt.NDArray[np.float64]:
     input_size = len(data.qpos)
     hidden = 8
@@ -96,7 +96,7 @@ def nn_controller(model: mj.MjModel, data: mj.MjData) -> npt.NDArray[np.float64]
     w2 = RNG.normal(0.0, 0.5, size=(hidden, output))
     return np.tanh(np.tanh(data.qpos @ w1) @ w2) * np.pi
 
-# ---------- Fitness ----------
+# ---------- Fitness (from template) ----------
 def fitness_function(history: list[list[float]]) -> float:
     xt, yt, zt = TARGET_POSITION
     xc, yc, zc = history[-1]
@@ -161,6 +161,7 @@ def gaussian_mutation(gen: list[np.ndarray], mut_prob: float, sigma: float) -> l
         mutated.append(new_chrom.astype(np.float32))
     return mutated
 
+# ---------- CPG training ----------
 def _find_core_geom_id(model: mj.MjModel) -> int | None:
     # Best-effort: find a geom with 'core' in its name for tracking last xyz
     for gid in range(model.ngeom):
@@ -246,7 +247,7 @@ class BodyCPGProblem(Problem):
             mj.set_mjcb_control(None)
 
         if xyz_last is None:
-            return 1e6  # failed sim → terrible distance
+            return 1e6  # failed sim -> terrible distance
         xt, yt, zt = TARGET_POSITION
         dx, dy, dz = xt - xyz_last[0], yt - xyz_last[1], zt - xyz_last[2]
         return float(math.sqrt(dx * dx + dy * dy + dz * dz))
@@ -272,7 +273,7 @@ class BodyCPGProblem(Problem):
 def optimize_cpg_cma_for_body(model: mj.MjModel, seconds: float = 6.0, pop: int = 40, gens: int = 20) -> np.ndarray:
     """Run a short CMA-ES on the CPG params for THIS body; return best params (numpy)."""
     nu = int(model.nu)
-    # Degenerate case: no actuators → return sensible dummy
+    # Degenerate case: no actuators -> return sensible dummy
     if nu == 0:
         return np.array([0.5, 1.0], dtype=np.float64)  # AMP, FREQ (unused)
 
@@ -303,6 +304,7 @@ def optimize_cpg_cma_for_body(model: mj.MjModel, seconds: float = 6.0, pop: int 
 
     return best_theta
 
+# ---------- Check viability (able to move)----------
 def decode_and_build(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray]):
     """Decode nde from a genotype and build robot"""
     p_type, p_conn, p_rot = nde.forward(genotype)
@@ -339,7 +341,7 @@ def check_viability(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray]
 
     return viability, hist
 
-# ---------- Evaluation (modified to train CPG per body) ----------
+# ---------- Evaluation (train CPG per body and report best fitness) ----------
 def evaluate(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray], sim_time: float) -> tuple[float, "DiGraph", np.ndarray]:
     """Check viability -> if viable train CPG via CMA-ES -> simulate with tracker -> fitness."""
     # Check viability
@@ -385,7 +387,6 @@ def evaluate(nde: NeuralDevelopmentalEncoding, genotype: list[np.ndarray], sim_t
     fit = fitness_function(hist)
     return fit, robot_graph, theta
 
-
 # ---------- Initialize viable population ----------
 def initialize_viable_population(nde: NeuralDevelopmentalEncoding, pop_size: int)-> list[np.ndarray]:
     population = []
@@ -412,7 +413,7 @@ def pick_parents(population: list[np.ndarray], fitnesses: list[float], beta: flo
             break
     else:
         idx2 = idx1
-        print(f"[yellow]Warning: Could not pick distinct parent after 10 attempts, using same parent twice[/yellow]")
+        console.log(f"[red]Warning: Could not pick distinct parent after 10 attempts, using same parent twice[/red]")
 
     return population[idx1], population[idx2]
 
@@ -421,13 +422,12 @@ def main() -> None:
     nde = NeuralDevelopmentalEncoding(number_of_modules=NUM_OF_MODULES) # Set NDE once, constant for entire run
     console.log(f"[bold cyan]Starting EA with CMA-ES CPG for {N_GEN} generations, pop={POP_SIZE}[/bold cyan]")
 
-    #population = [random_genotype() for _ in range(POP_SIZE)]
     population = initialize_viable_population(nde, POP_SIZE)
     best_fit = -np.inf
     best_graph = None
     best_theta = None
 
-    # Setup best fitness output csv file
+    # Setup best fitness output csv file (appended at each generation)
     fitness_folder = DATA / "fitness_per_gen"
     fitness_folder.mkdir(exist_ok=True)
     fitness_file = fitness_folder / f"fitness_{TIMESTAMP}.csv"
@@ -444,32 +444,33 @@ def main() -> None:
         for i, geno in enumerate(population):
             fit, graph, theta = evaluate(nde, geno, sim_time)
             fitnesses[i] = fit
-            console.log(f"Robot {i:02d} → fitness = {fit:.4f} (sim time {sim_time:.1f}s)")
+            console.log(f"Robot {i:02d} -> fitness = {fit:.4f} (sim time {sim_time:.1f}s)")
             if fit > best_fit:
                 best_fit, best_graph, best_theta = fit, graph, theta
 
         # Parent selection (elitism and probabilistic)
+        fitnesses = np.maximum(fitnesses, -10.0) #failsave to set all fitnesses to >-10, to prevent overflow error in pick_parents() when a robot falls of the platform
         sorted_idx = np.argsort(fitnesses)
-        elite_idx = sorted_idx[-ELITISM_SIZE:] #top-n elites are always kept for the next generation
+        elite_idx = sorted_idx[-ELITISM_SIZE:] #top-n elites are always kept (unchanged) for the next generation
         elites = [population[i] for i in elite_idx]
         console.log(f"Best fitness={fitnesses[elite_idx[-1]]:.4f}")
         new_pop = elites.copy()
         while len(new_pop) < POP_SIZE:
             #p1, p2 = RNG.choice(parent_pool, 2, replace=True)
             p1, p2 = pick_parents(population, fitnesses, beta=PICK_PARENTS_BETA)
-            child = crossover_per_chromosome(p1, p2, CX_PROB)[0] #only use one of the two children
+            child = crossover_per_chromosome(p1, p2, CX_PROB)[0] #only use one of the two crossover children to increase exploration
             child = gaussian_mutation(child, MUT_PROB, MUT_SIGMA)
             new_pop.append(child)
         population = new_pop
 
-        # Save best fitness in csv
+        # Save best fitness per gen in csv
         with open(fitness_file, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([gen, best_fit])
         
-        # Save video at 4 checkpoints
-        if (gen + 1) % (N_GEN // 4) == 0:
-            console.log(f"[yellow]Checkpoint: recording video at generation {gen+1}[/yellow]")
+        # Save best video, body json and CPG params at 10 checkpoints
+        if N_GEN >9 and (gen + 1) % (N_GEN // 10) == 0:
+            console.log(f"[yellow]Checkpoint: saving video, json and paramaters at generation {gen}[/yellow]")
             best_core = construct_mjspec_from_graph(best_graph)
 
             def cpg_video_controller(m: mj.MjModel, d: mj.MjData) -> npt.NDArray[np.float64]:
@@ -482,20 +483,42 @@ def main() -> None:
 
             video_folder = DATA / "videos"
             video_folder.mkdir(exist_ok=True)
-            video_file = video_folder / f"video_gen{gen+1}_{TIMESTAMP}.mp4"
             experiment(robot=best_core, controller=ctrl, duration=sim_time, record=True)
-            console.log(f"[green]Saved checkpoint video → {video_file}[/green]")
+            console.log(f"[green]Saved checkpoint video in {video_folder}[/green]")
+
+            #save current best body json
+            graph_folder = DATA / "best_robot_graphs_checkpoints"
+            graph_folder.mkdir(exist_ok=True)
+            graph_file = f"best_robot_{TIMESTAMP}_gen{gen}.json"
+            save_graph_as_json(best_graph, graph_folder / graph_file)
+            console.log(f"[green]Saved checkpoint body json at {graph_folder / graph_file}[/green]")
+
+            #save current best CPG params
+            params_folder = DATA / "best_robot_params_checkpoints"
+            params_folder.mkdir(exist_ok=True)
+            params_file = f"best_robot_{TIMESTAMP}_gen{gen}.txt"
+            with open(params_folder/params_file, "w") as f:
+                f.write(", ".join(map(str,best_theta)))
+            console.log(f"[green]Saved checkpoint CPG params at {params_folder/params_file}[/green]")
 
     # ---------- After final generation ----------
     console.rule("[bold magenta]Final best robot[/bold magenta]")
     console.log(f"Best fitness = {best_fit:.4f}")
 
-    # Save graph JSON
+    # Save body graph json for best robot
     graph_folder = DATA / "best_robot_graphs"
     graph_folder.mkdir(exist_ok=True)
     graph_file = f"best_robot_{TIMESTAMP}.json"
     save_graph_as_json(best_graph, graph_folder / graph_file)
-    print(f"\nSaved best robot graph to {graph_folder / graph_file}")
+    console.log(f"\n[green]Saved best robot graph to {graph_folder / graph_file}[/green]")
+
+    # Save CPG parameters for best robot
+    params_folder = DATA / "best_robot_params"
+    params_folder.mkdir(exist_ok=True)
+    params_file = f"best_robot_{TIMESTAMP}.txt"
+    with open(params_folder/params_file, "w") as f:
+        f.write(", ".join(map(str,best_theta)))
+    console.log(f"\n[green]Saved best robot parameters to {params_folder/params_file}[/green]")
 
     # Save video for best robot with trained CPG
     best_core = construct_mjspec_from_graph(best_graph)
