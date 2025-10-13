@@ -2,7 +2,7 @@
 
 # ---------- Imports ----------
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List
+from typing import TYPE_CHECKING, Any
 import math
 import numpy as np
 import numpy.typing as npt
@@ -53,11 +53,11 @@ POP_SIZE = 10
 N_GEN = 100
 CX_PROB = 0.6
 MUT_PROB = 0.5 
-MUT_SIGMA = 0.1
+MUT_SIGMA = 0.2
 ELITISM_SIZE = 2 # Best n always kept for the next generation
 PICK_PARENTS_BETA = 5 #higher value -> favors higher fitnesses to be picked as parents
 if N_GEN > 30:
-    SIM_TIME_STAGES = [10.0, 20.0, 50.0, 80.0] #dynamic simulation time based on gen num (per 25% of total generations)
+    SIM_TIME_STAGES = [10.0, 20.0, 40.0, 70.0] #dynamic simulation time based on gen num (per 25% of total generations)
 else: SIM_TIME_STAGES = [10.0, 10.0, 15.0, 20.0] #for test-running short runs
 
 #Inner EA loop parameters (evolving the CPG/brain)
